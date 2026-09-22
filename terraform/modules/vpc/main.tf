@@ -64,7 +64,7 @@ resource "aws_nat_gateway" "nat-gw" {
   vpc_id            = aws_vpc.main.id
   connectivity_type = "public"
   availability_mode = "regional"
-  allocation_id     = aws_eip.nat-eip
+  allocation_id     = aws_eip.nat-eip.id
 
   tags = merge({
     "Name"    = "${var.project_name}-natgw"
@@ -168,5 +168,5 @@ resource "aws_route_table_association" "app" {
 resource "aws_route_table_association" "db" {
   count          = local.az_count
   subnet_id      = element(aws_subnet.db.*.id, count.index)
-  route_table_id = aws_route_table.private
+  route_table_id = aws_route_table.private.id
 }

@@ -70,7 +70,7 @@ build {
   provisioner "shell" {
     inline = [
       "echo '==> Making scripts executable...'",
-      "chmod +x /tmp/scripts/*.sh",
+      "chmod +x /tmp/scripts/control-plane.sh",
 
       "echo '==> Executing setup script...'",
       "sudo /tmp/scripts/control-plane.sh",
@@ -92,10 +92,10 @@ build {
   provisioner "shell" {
     inline = [
       "echo '==> Making scripts executable...'",
-      "chmod +x /tmp/scripts/*.sh",
+      "chmod +x /tmp/scripts/worker-plane.sh",
 
       "echo '==> Executing setup script...'",
-      "sudo /tmp/scripts/worker-plane.sh.sh",
+      "sudo /tmp/scripts/worker-plane.sh",
 
       "echo '==> Cleaning up temporary upload directory...'",
       "rm -rf /tmp/scripts"
