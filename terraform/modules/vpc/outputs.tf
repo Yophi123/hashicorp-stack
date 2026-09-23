@@ -43,3 +43,23 @@ output "db_subnet_ids" {
   value       = aws_subnet.db.*.id
   description = "List of database subnet IDs"
 }
+
+output "zone_id" {
+  value       = aws_route53_zone.private.zone_id
+  description = "Private hosted zone ID. Pass to the EC2/NLB module."
+}
+
+output "zone_arn" {
+  value       = aws_route53_zone.private.arn
+  description = "ARN of the private hosted zone"
+}
+
+output "zone_name" {
+  value       = local.private_zone_name
+  description = "Zone name without trailing dot. Pass to the EC2/NLB module."
+}
+
+output "record_fqdns" {
+  value       = { for k, r in aws_route53_record.this : k => r.fqdn }
+  description = "Map of record key to created FQDN"
+}

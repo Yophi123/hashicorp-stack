@@ -15,6 +15,7 @@ locals {
     app      = 2
     web      = 3
   }
+  private_zone_name = trimsuffix(var.private_zone_name, ".")
 }
 
 ## VPC 
@@ -170,3 +171,43 @@ resource "aws_route_table_association" "db" {
   subnet_id      = element(aws_subnet.db.*.id, count.index)
   route_table_id = aws_route_table.private.id
 }
+
+## Private Hosted Zone
+resource "aws_route53_zone" "private" {
+  name          = local.private_zone_name
+  comment       = "Private zone for ${var.project_name}"
+  force_destroy = var.records_force_destroy
+
+  vpc {
+    vpc_id = aws_vpc.main.id
+  }
+
+  tags = merge({
+    "Project" = var.project_name
+  }, var.tags)
+
+  lifecycle {
+    ignore_changes = [vpc]
+  }
+}
+
+resource "aws_route53_record" "this" {
+  for_each = var.records
+  zone_id  = aws_route53_zone.private.zone_id
+  name     = each.value.name == "" ? local.private_zone_name : "${each.value.name}.${local.private_zone_name}"
+  type     = each.value.type
+
+  ttl     = each.value.alias == null ? each.value.ttl : null
+  records = each.value.alias == null ? each.value.records : null
+
+  dynamic "alias" {
+    for_each = each.value.alias == null ? [] : [each.value.alias]
+    content {
+      name                   = alias.value.dns_name
+      zone_id                = alias.value.zone_id
+      evaluate_target_health = alias.value.evaluate_target_health
+    }
+  }
+}
+
+
