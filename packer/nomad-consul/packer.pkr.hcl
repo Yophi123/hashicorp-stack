@@ -39,7 +39,7 @@ source "amazon-ebs" "nomad-consul-client" {
   region        = var.region
   instance_type = var.instance_type
   profile       = "packer"
-  ami_name      = "nomad-consul-server-${local.timestamp}"
+  ami_name      = "nomad-consul-client-${local.timestamp}"
   ssh_username  = "ubuntu"
 
   source_ami_filter {
@@ -63,7 +63,7 @@ build {
   sources = ["source.amazon-ebs.nomad-consul-server"]
 
   provisioner "file" {
-    source      = "./scripts/control-plane.sh"
+    source      = "./scripts"
     destination = "/tmp/scripts"
   }
 
@@ -85,7 +85,7 @@ build {
   sources = ["source.amazon-ebs.nomad-consul-client"]
 
   provisioner "file" {
-    source      = "./scripts/worker-plane.sh"
+    source      = "./scripts"
     destination = "/tmp/scripts"
   }
 

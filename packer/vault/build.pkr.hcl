@@ -12,11 +12,11 @@ locals {
   timestamp = formatdate("YYYY-MM-DD", timestamp())
 }
 
-source "amazon-ebs" "boundary-vault" {
+source "amazon-ebs" "vault" {
   region        = var.region
   instance_type = var.instance_type
   profile       = "packer"
-  ami_name      = "boundary-vault-server-${local.timestamp}"
+  ami_name      = "vault-server-${local.timestamp}"
   ssh_username  = "ubuntu"
 
   source_ami_filter {
@@ -30,14 +30,14 @@ source "amazon-ebs" "boundary-vault" {
   }
 
   tags = {
-    Name    = "boundary-vault-server"
-    Role    = "boundary-vault-control-plane"
+    Name    = "vault-server"
+    Role    = "vault-control-plane"
     BuiltBy = "packer"
   }
 }
 
 build {
-  sources = ["source.amazon-ebs.boundary-vault"]
+  sources = ["source.amazon-ebs.vault"]
 
   provisioner "file" {
     source      = "./scripts"
