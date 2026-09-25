@@ -3,7 +3,6 @@ output "vpc-id" {
   description = "ID of the VPC"
 }
 
-
 output "vpc-arn" {
   value       = aws_vpc.main.arn
   description = "ARN of the VPC"

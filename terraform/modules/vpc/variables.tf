@@ -22,12 +22,12 @@ variable "private_zone_name" {
   EOT
 
   validation {
-    condition     = length(split(".", trimsuffix(var.zone_name, "."))) >= 2
-    error_message = "zone_name must be fully qualified, e.g. hashicorp-stack.internal (not a single label)."
+    condition     = length(split(".", trimsuffix(var.private_zone_name, "."))) >= 2
+    error_message = "private_zone_name must be fully qualified, e.g. hashicorp-stack.internal (not a single label)."
   }
 
   validation {
-    condition     = !endswith(trimsuffix(var.zone_name, "."), ".local")
+    condition     = !endswith(trimsuffix(var.private_zone_name, "."), ".local")
     error_message = "Do not use the .local TLD; it collides with mDNS resolvers."
   }
 }

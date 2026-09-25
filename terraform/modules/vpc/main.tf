@@ -51,21 +51,20 @@ resource "aws_egress_only_internet_gateway" "eigw" {
 }
 
 ## The NAT Elastic IP
-resource "aws_eip" "nat-eip" {
-  domain     = "vpc"
-  depends_on = [aws_internet_gateway.igw]
-  tags = merge({
-    "Name"    = "${var.project_name}-nat-eip"
-    "Project" = var.project_name
-  }, var.tags)
-}
+# resource "aws_eip" "nat-eip" {
+#   domain     = "vpc"
+#   depends_on = [aws_internet_gateway.igw]
+#   tags = merge({
+#     "Name"    = "${var.project_name}-nat-eip"
+#     "Project" = var.project_name
+#   }, var.tags)
+# }
 
 ## Regional NAT Gateway
 resource "aws_nat_gateway" "nat-gw" {
   vpc_id            = aws_vpc.main.id
   connectivity_type = "public"
   availability_mode = "regional"
-  allocation_id     = aws_eip.nat-eip.id
 
   tags = merge({
     "Name"    = "${var.project_name}-natgw"
