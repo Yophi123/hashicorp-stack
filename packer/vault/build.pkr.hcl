@@ -14,6 +14,7 @@ locals {
 
 source "amazon-ebs" "vault" {
   region        = var.region
+  # ami_regions   = var.ami_regions
   instance_type = var.instance_type
   profile       = "packer"
   ami_name      = "vault-server-${local.timestamp}"

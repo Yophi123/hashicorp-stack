@@ -13,6 +13,7 @@ locals {
 
 source "amazon-ebs" "boundary" {
   region        = var.region
+  # ami_regions   = var.ami_regions
   instance_type = var.instance_type
   profile       = "packer"
   ami_name      = "boundary-server-${local.timestamp}"

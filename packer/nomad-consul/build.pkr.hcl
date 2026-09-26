@@ -13,6 +13,7 @@ locals {
 
 source "amazon-ebs" "nomad-consul-server" {
   region        = var.region
+  # ami_regions   = var.ami_regions
   instance_type = var.instance_type
   profile       = "packer"
   ami_name      = "nomad-consul-server-${local.timestamp}"
@@ -37,6 +38,7 @@ source "amazon-ebs" "nomad-consul-server" {
 
 source "amazon-ebs" "nomad-consul-client" {
   region        = var.region
+  # ami_regions   = var.ami_regions
   instance_type = var.instance_type
   profile       = "packer"
   ami_name      = "nomad-consul-client-${local.timestamp}"
