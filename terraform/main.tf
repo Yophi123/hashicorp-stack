@@ -25,16 +25,22 @@ module "kms_vault_unseal" {
   source       = "./modules/kms"
   alias        = "vault-unseal"
 }
+
+## KMS Key wraps everything Boundary stores in Postgres — target credentials, host catalog secrets, per-scope key hierarchies
 module "kms_boundary_root" {
   project_name = "hashicorp-stack"
   source       = "./modules/kms"
   alias        = "boundary-root"
 }
+
+## KMS key for how a worker proves its identity to a controller.
 module "kms_boundary_worker" {
   source       = "./modules/kms"
   alias        = "boundary-worker-auth"
   project_name = "hashicorp-stack"
 }
+
+## KMS key for a break-glass path into the API when you've lost admin credentials or the auth method is broken.
 module "kms_boundary_recovery" {
   source       = "./modules/kms"
   alias        = "boundary-recovery"

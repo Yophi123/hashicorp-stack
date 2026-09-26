@@ -270,7 +270,7 @@ resource "aws_vpc_security_group_ingress_rule" "rds_from_boundary" {
 # on the external target groups, so the instance SG sees the NLB, not the client.
 resource "aws_security_group" "nlb_external" {
   name_prefix = "${var.project_name}-nlb-ext-"
-  description = "Internet-facing NLB for Boundary"
+  description = "Internet-facing NLB"
   vpc_id      = var.vpc_id
 
   tags = merge({
@@ -533,7 +533,7 @@ resource "aws_lb_target_group" "external" {
   }
 }
 
-## Auto Scaling groups
+## Auto Scaling groups - ASG
 resource "aws_autoscaling_group" "node" {
   for_each = var.node_groups
 
@@ -608,6 +608,14 @@ resource "aws_autoscaling_group" "node" {
     create_before_destroy = true
     ignore_changes        = [desired_capacity]
   }
+
+
+  depends_on = [
+    aws_iam_role_policy.autojoin,
+    aws_iam_role_policy.vault_unseal,
+    aws_iam_role_policy.boundary,
+    aws_iam_role_policy_attachment.ssm,
+  ]
 }
 
 ## Load balancers
