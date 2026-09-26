@@ -9,7 +9,7 @@ output "service_endpoints" {
 }
 
 output "ec2_ami_ids" {
-  value = module.ec2.ami_ids
+  value       = module.ec2.ami_ids
   description = "Ami ids of the packer images"
 }
 

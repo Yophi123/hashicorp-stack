@@ -16,7 +16,9 @@ module "rds" {
   vpc_id                  = module.networking.vpc-id
   username                = "hashicorp_user"
   subnet_ids              = module.networking.db_subnet_ids
-  skip_final_snapshot     = true
+  # Evaluation posture: allows a clean `terraform destroy`. Flip both for production.
+  skip_final_snapshot = true
+  deletion_protection = false
 }
 
 # KMS Keys

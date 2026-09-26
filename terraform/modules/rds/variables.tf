@@ -93,6 +93,28 @@ variable "skip_final_snapshot" {
   default     = false
 }
 
+variable "backup_retention_period" {
+  description = "Days to keep automated backups (0-35). Enables point-in-time recovery; 0 disables backups and read replicas."
+  type        = number
+  default     = 7
+
+  validation {
+    condition     = var.backup_retention_period >= 0 && var.backup_retention_period <= 35
+    error_message = "backup_retention_period must be between 0 and 35."
+  }
+
+  validation {
+    condition     = var.db_replica_count == 0 || var.backup_retention_period > 0
+    error_message = "Read replicas need automated backups on the source; set backup_retention_period > 0."
+  }
+}
+
+variable "deletion_protection" {
+  description = "Block deletion of the instance (and replicas) until this is set back to false and applied."
+  type        = bool
+  default     = true
+}
+
 variable "tags" {
   description = "Tags merged onto all resources created by this module."
   type        = map(string)

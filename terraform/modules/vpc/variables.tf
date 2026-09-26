@@ -79,18 +79,21 @@ variable "enable_dns_support" {
 }
 
 variable "enable_dhcp_options" {
-  type    = bool
-  default = true
+  type        = bool
+  description = "Attach a DHCP option set that adds the private zone to the instance DNS search path."
+  default     = true
 }
 
 variable "map_public_ip_on_launch" {
-  type    = bool
-  default = true
+  type        = bool
+  description = "Auto-assign public IPv4 addresses in the web tier. Off by default: only NLBs belong there."
+  default     = false
 }
 
 variable "ipv6_enabled" {
-  type    = bool
-  default = false
+  type        = bool
+  description = "Assign an Amazon-provided IPv6 /56 to the VPC and a /64 to every subnet. Private tiers egress via an egress-only IGW."
+  default     = false
 }
 
 variable "tags" {

@@ -64,7 +64,7 @@ resource "aws_db_instance" "this" {
 
   allocated_storage         = var.allocated_storage
   storage_encrypted         = var.storage_encrypted
-  final_snapshot_identifier = var.skip_final_snapshot ? null : "${var.project_name}-final-snapshot-${formatdate("YYYY-MM-DD", timestamp())}"
+  final_snapshot_identifier = var.skip_final_snapshot ? null : "${var.project_name}-final-snapshot"
 
   db_name  = replace("${var.project_name}_primary_rds", "-", "_")
   username = var.username
@@ -75,6 +75,10 @@ resource "aws_db_instance" "this" {
 
   multi_az            = var.multi_az
   skip_final_snapshot = var.skip_final_snapshot
+
+  backup_retention_period = var.backup_retention_period
+  deletion_protection     = var.deletion_protection
+  copy_tags_to_snapshot   = true
 
   tags = merge({
     "Project" = var.project_name
@@ -91,6 +95,7 @@ resource "aws_db_instance" "replica" {
 
   vpc_security_group_ids = [aws_security_group.this.id]
   skip_final_snapshot    = var.skip_final_snapshot
+  deletion_protection    = var.deletion_protection
   tags = merge({
     "Project" = var.project_name
   }, var.tags)

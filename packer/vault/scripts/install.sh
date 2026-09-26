@@ -14,6 +14,7 @@ apt-get install -y \
     lsb-release \
     apt-transport-https \
     ca-certificates
+snap install aws-cli --classic
 
 echo "==> [2/5] Installing Hashicorp Repo..."
 install -m 0755 -d /etc/apt/keyrings

@@ -1,6 +1,6 @@
 data "aws_ami" "ami_ids" {
-  region = var.region
-  for_each = var.node_groups
+  region      = var.region
+  for_each    = var.node_groups
   most_recent = true
   owners      = var.ami_owners
 
@@ -51,7 +51,7 @@ data "aws_iam_policy_document" "autojoin" {
 data "aws_iam_policy_document" "vault_unseal" {
   statement {
     effect    = "Allow"
-    actions   = ["kms:Encrypt", "kms:Decrypt", "kms:DescribeKey"]
+    actions   = ["kms:Encrypt", "kms:Decrypt", "kms:DescribeKey", "kms:GenerateDataKey"]
     resources = [var.kms_key_arns.vault_unseal]
   }
 }
@@ -59,7 +59,7 @@ data "aws_iam_policy_document" "vault_unseal" {
 data "aws_iam_policy_document" "boundary" {
   statement {
     effect  = "Allow"
-    actions = ["kms:Encrypt", "kms:Decrypt", "kms:DescribeKey"]
+    actions = ["kms:Encrypt", "kms:Decrypt", "kms:DescribeKey", "kms:GenerateDataKey"]
     resources = [
       var.kms_key_arns.boundary_root,
       var.kms_key_arns.boundary_worker_auth,
