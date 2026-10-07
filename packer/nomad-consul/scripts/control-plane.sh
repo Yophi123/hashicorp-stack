@@ -16,8 +16,17 @@ apt-get install -y \
     jq \
     lsb-release \
     apt-transport-https \
-    ca-certificates
-snap install aws-cli --classic
+    ca-certificates \
+    jq \
+    unzip \
+    nvme-cli
+
+echo "==> Installing AWS CLI"    
+# AWS CLI v2, used by user data to read secrets and attach volumes.
+curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+unzip -q /tmp/awscliv2.zip -d /tmp
+/tmp/aws/install
+rm -rf /tmp/aws /tmp/awscliv2.zip
 
 echo "==> [2/8] Installing Hashicorp Repo..."
 install -m 0755 -d /etc/apt/keyrings
@@ -52,9 +61,9 @@ mkdir -p /etc/nomad.d /var/lib/nomad
 chown -R nomad:nomad /etc/nomad.d /var/lib/nomad
 chmod 750 /etc/nomad.d /var/lib/nomad
 
-echo "==> [7/8] Enabling Systemd services..."
-systemctl enable consul
-systemctl enable nomad
+echo "==> [7/8] Leaving services disabled until user data writes their config..."
+systemctl disable --now nomad consul
+rm -f /etc/nomad.d/nomad.hcl /etc/consul.d/consul.hcl
 
 echo "==> [8/8] Cleaning up image artifacts..."
 apt-get clean

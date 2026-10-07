@@ -6,13 +6,13 @@ terraform {
     }
   }
 
-  backend "s3" {
-    bucket       = "hashicorp-stack-04321"
-    region       = "ap-southeast-1"
-    encrypt      = true
-    use_lockfile = true
-    key          = "hashicorp-stack/terraform.tfstate"
-  }
+  # backend "s3" {
+  #   bucket       = "hashicorp-stack-04321"
+  #   region       = "ap-southeast-1"
+  #   encrypt      = true
+  #   use_lockfile = true
+  #   key          = "hashicorp-stack/terraform.tfstate"
+  # }
 }
 
 provider "aws" {

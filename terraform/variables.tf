@@ -12,3 +12,8 @@ variable "allowed_client_cidrs" {
     control plane and the open internet.
   EOT
 }
+
+variable "hashicorp_stack_domain" {
+  type = string
+  description = "Public domain name that will be used"
+}

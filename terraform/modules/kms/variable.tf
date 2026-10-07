@@ -42,6 +42,12 @@ variable "policy" {
   default     = null
 }
 
+variable "multi_region" {
+  description = "Create a multi-region primary key that can be replicated to another region. Cannot be changed after creation."
+  type        = bool
+  default     = false
+}
+
 variable "tags" {
   description = "Tags applied to the KMS key and alias."
   type        = map(string)

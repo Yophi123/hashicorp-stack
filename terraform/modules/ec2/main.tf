@@ -1,131 +1,21 @@
-data "aws_ami" "ami_ids" {
-  region      = var.region
-  for_each    = var.node_groups
-  most_recent = true
-  owners      = var.ami_owners
-
-  filter {
-    name   = "tag:Role"
-    values = [lookup(var.ami_role_tags, each.key)]
-  }
-
-  filter {
-    name   = "tag:BuiltBy"
-    values = ["packer"]
-  }
-
-  filter {
-    name   = "state"
-    values = ["available"]
-  }
-
-  filter {
-    name   = "virtualization-type"
-    values = ["hvm"]
-  }
-
-  filter {
-    name   = "root-device-type"
-    values = ["ebs"]
-  }
-}
-
-data "aws_iam_policy_document" "assume" {
-  statement {
-    actions = ["sts:AssumeRole"]
-    principals {
-      type        = "Service"
-      identifiers = ["ec2.amazonaws.com"]
-    }
-  }
-}
-
-data "aws_iam_policy_document" "autojoin" {
-  statement {
-    effect    = "Allow"
-    actions   = ["ec2:DescribeInstances", "autoscaling:DescribeAutoScalingGroups"]
-    resources = ["*"]
-  }
-}
-
-data "aws_iam_policy_document" "vault_unseal" {
-  statement {
-    effect    = "Allow"
-    actions   = ["kms:Encrypt", "kms:Decrypt", "kms:DescribeKey", "kms:GenerateDataKey"]
-    resources = [var.kms_key_arns.vault_unseal]
-  }
-}
-
-data "aws_iam_policy_document" "boundary" {
-  statement {
-    effect  = "Allow"
-    actions = ["kms:Encrypt", "kms:Decrypt", "kms:DescribeKey", "kms:GenerateDataKey"]
-    resources = [
-      var.kms_key_arns.boundary_root,
-      var.kms_key_arns.boundary_worker_auth,
-      var.kms_key_arns.boundary_recovery,
-    ]
-  }
-
-  statement {
-    effect    = "Allow"
-    actions   = ["secretsmanager:GetSecretValue"]
-    resources = [var.boundary_db.secret_arn]
-  }
-
-  dynamic "statement" {
-    for_each = var.boundary_db_kms_key_id == null ? [] : [1]
-    content {
-      effect    = "Allow"
-      actions   = ["kms:Decrypt"]
-      resources = [var.boundary_db_kms_key_id]
-    }
-  }
-}
-
-data "aws_iam_policy_document" "bootstrap_vault" {
-  count = var.enable_bootstrap_automation ? 1 : 0
-
-  statement {
-    effect    = "Allow"
-    actions   = ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:UpdateItem"]
-    resources = [aws_dynamodb_table.bootstrap_lock[0].arn]
-  }
-
-  statement {
-    effect    = "Allow"
-    actions   = ["secretsmanager:PutSecretValue"]
-    resources = [aws_secretsmanager_secret.vault_init[0].arn]
-  }
-}
-
-data "aws_iam_policy_document" "bootstrap_boundary" {
-  count = var.enable_bootstrap_automation ? 1 : 0
-
-  statement {
-    effect    = "Allow"
-    actions   = ["dynamodb:PutItem", "dynamodb:GetItem", "dynamodb:UpdateItem"]
-    resources = [aws_dynamodb_table.bootstrap_lock[0].arn]
-  }
-
-  statement {
-    effect    = "Allow"
-    actions   = ["secretsmanager:PutSecretValue"]
-    resources = [aws_secretsmanager_secret.boundary_init[0].arn]
-  }
-}
-
 locals {
-  ami_by_group = { for k, _ in var.node_groups : k => data.aws_ami.ami_ids[k].id }
+  groups = keys(var.node_groups)
 
-  # Ports are properties of the products, not of this deployment.
+  has_servers  = contains(local.groups, "nomad_consul_server")
+  has_workers  = contains(local.groups, "nomad_worker")
+  has_vault    = contains(local.groups, "vault")
+  has_boundary = contains(local.groups, "boundary")
+
+  tags = merge(var.tags, { Project = var.project_name })
+
+  # Ports are facts about the products, not about this deployment.
   ports = {
+    ssh = 22
     consul = {
       server_rpc = 8300
       serf_lan   = 8301
       serf_wan   = 8302
       http       = 8500
-      https      = 8501
       grpc       = 8502
       dns        = 8600
     }
@@ -142,96 +32,250 @@ locals {
       api     = 9200
       cluster = 9201
       proxy   = 9202
+      ops     = 9203
+    }
+    # Nomad's dynamic port range for tasks and Envoy sidecars.
+    workload = {
+      min = 20000
+      max = 32000
     }
   }
 
-  # Intra-cluster TCP ingress, sourced from the VPC CIDR.
-  intra_tcp = {
-    nomad_consul_server = [8300, 8301, 8302, 8500, 8501, 8502, 8600, 4646, 4647, 4648]
-    nomad_worker        = [8301, 8302, 8500, 8600, 4646, 4647, 4648]
-    boundary            = [9200, 9201, 9202, 8301, 8500]
-    vault               = [8200, 8201]
-  }
-
-  # Gossip needs UDP as well as TCP.
-  intra_udp = {
-    nomad_consul_server = [8301, 8302, 8600, 4648]
-    nomad_worker        = [8301, 8302, 8600, 4648]
-    boundary            = [8301]
-    vault               = []
-  }
-
-  tcp_rules = merge([
-    for group, plist in local.intra_tcp : {
-      for p in plist : "${group}-tcp-${p}" => { group = group, port = p }
+  # What each group listens on for the rest of the VPC (peers, the ALB, the
+  # Boundary worker). Every group runs a Consul agent, hence serf_lan everywhere.
+  vpc_ingress = {
+    nomad_consul_server = {
+      tcp = [
+        local.ports.consul.server_rpc,
+        local.ports.consul.serf_lan,
+        local.ports.consul.serf_wan,
+        local.ports.consul.http,
+        local.ports.consul.grpc,
+        local.ports.consul.dns,
+        local.ports.nomad.http,
+        local.ports.nomad.rpc,
+        local.ports.nomad.serf,
+      ]
+      udp = [
+        local.ports.consul.serf_lan,
+        local.ports.consul.serf_wan,
+        local.ports.consul.dns,
+        local.ports.nomad.serf,
+      ]
     }
-  ]...) # using ... for merging a dynamically generated list of maps.
-
-  udp_rules = merge([
-    for group, plist in local.intra_udp : {
-      for p in plist : "${group}-udp-${p}" => { group = group, port = p }
+    nomad_worker = {
+      tcp = [local.ports.consul.serf_lan, local.ports.nomad.http]
+      udp = [local.ports.consul.serf_lan]
     }
-  ]...)
-
-  # Services fronted by the internal NLB: record name => target group key.
-  internal_services = {
-    vault    = { hostname = var.service_hostnames.vault, port = local.ports.vault.api, group = "vault" }
-    consul   = { hostname = var.service_hostnames.consul, port = local.ports.consul.http, group = "nomad_consul_server" }
-    nomad    = { hostname = var.service_hostnames.nomad, port = local.ports.nomad.http, group = "nomad_consul_server" }
-    boundary = { hostname = var.service_hostnames.boundary, port = local.ports.boundary.api, group = "boundary" }
+    vault = {
+      tcp = [local.ports.vault.api, local.ports.vault.cluster, local.ports.consul.serf_lan]
+      udp = [local.ports.consul.serf_lan]
+    }
+    boundary = {
+      tcp = [
+        local.ports.boundary.api,
+        local.ports.boundary.cluster,
+        local.ports.boundary.ops,
+        local.ports.consul.serf_lan,
+      ]
+      udp = [local.ports.consul.serf_lan]
+    }
   }
 
-  # Externally exposed: Boundary controller API and worker proxy only.
-  external_services = {
-    api   = { port = local.ports.boundary.api }
-    proxy = { port = local.ports.boundary.proxy }
+  vpc_rules = {
+    for r in flatten([
+      for group, protos in local.vpc_ingress : [
+        for proto, plist in protos : [
+          for p in plist : { group = group, protocol = proto, port = p }
+        ]
+      ] if contains(local.groups, group)
+    ]) : "${r.group}-${r.protocol}-${r.port}" => r
+  }
+
+  # Server-to-server traffic between the two sites: RPC and WAN gossip only.
+  federation_ingress = {
+    tcp = [
+      local.ports.consul.server_rpc,
+      local.ports.consul.serf_wan,
+      local.ports.nomad.rpc,
+      local.ports.nomad.serf,
+    ]
+    udp = [local.ports.consul.serf_wan, local.ports.nomad.serf]
+  }
+
+  peer_rules = {
+    for r in flatten([
+      for cidr in var.federation.peer_vpc_cidrs : [
+        for proto, plist in local.federation_ingress : [
+          for p in plist : { cidr = cidr, protocol = proto, port = p }
+        ]
+      ]
+    ]) : "${r.cidr}-${r.protocol}-${r.port}" => r
+    if local.has_servers
+  }
+
+  # Cloud auto-join. The tag value is the same at both sites; the region in
+  # the join string is what keeps LAN joins local and WAN joins remote.
+  consul_join_tag = "${var.project_name}-nomad_consul_server"
+  vault_join_tag  = "${var.project_name}-vault"
+
+  wan_join = [
+    for r in var.federation.peer_aws_regions :
+    "provider=aws region=${r} tag_key=${var.retry_join_tag_key} tag_value=${local.consul_join_tag}"
+  ]
+
+  bootstrap_expect = try(var.node_groups["nomad_consul_server"].desired_capacity, 1)
+
+  bootstrap_roles = var.enable_bootstrap_automation ? ["vault", "boundary"] : []
+  lock_table      = try(aws_dynamodb_table.bootstrap_lock[0].name, "")
+
+  instance_tags = {
+    for k, g in var.node_groups : k => merge(local.tags, g.extra_tags, {
+      Name                     = "${var.project_name}-${k}"
+      Role                     = k
+      (var.retry_join_tag_key) = "${var.project_name}-${k}"
+    })
+  }
+
+  # Each launch template renders only its own entry, so a change to one
+  # role's inputs re-versions that role's template and nothing else.
+  user_data_vars = {
+    nomad_consul_server = {
+      consul_datacenter    = var.consul_datacenter
+      nomad_region         = var.nomad_region
+      primary_datacenter   = coalesce(var.federation.consul_primary_datacenter, var.consul_datacenter)
+      authoritative_region = coalesce(var.federation.nomad_authoritative_region, var.nomad_region)
+      bootstrap_expect     = local.bootstrap_expect
+      ports                = local.ports
+      join_tag_key         = var.retry_join_tag_key
+      consul_join_tag      = local.consul_join_tag
+      wan_join             = local.wan_join
+    }
+
+    nomad_worker = {
+      consul_datacenter = var.consul_datacenter
+      nomad_region      = var.nomad_region
+      ports             = local.ports
+      join_tag_key      = var.retry_join_tag_key
+      consul_join_tag   = local.consul_join_tag
+    }
+
+    vault = {
+      project_name      = var.project_name
+      consul_datacenter = var.consul_datacenter
+      ports             = local.ports
+      join_tag_key      = var.retry_join_tag_key
+      consul_join_tag   = local.consul_join_tag
+      vault_join_tag    = local.vault_join_tag
+      vault_kms_key_id  = var.kms_key_arns.vault_unseal
+      vault_node_count  = try(var.node_groups["vault"].desired_capacity, 1)
+      bootstrap_enabled = var.enable_bootstrap_automation
+      vault_init_secret = try(aws_secretsmanager_secret.vault_init[0].arn, "")
+    }
+
+    boundary = {
+      project_name         = var.project_name
+      consul_datacenter    = var.consul_datacenter
+      ports                = local.ports
+      join_tag_key         = var.retry_join_tag_key
+      consul_join_tag      = local.consul_join_tag
+      boundary_kms         = var.kms_key_arns
+      boundary_db          = var.boundary_db
+      bootstrap_enabled    = var.enable_bootstrap_automation
+      boundary_init_secret = try(aws_secretsmanager_secret.boundary_init[0].arn, "")
+    }
   }
 }
 
+## Security groups
 resource "aws_security_group" "node" {
-  for_each    = var.node_groups
+  for_each = var.node_groups
+
   name_prefix = "${var.project_name}-${each.key}-"
-  description = "Instances in the ${each.key} ASG"
+  description = "Instances in the ${each.key} node group"
   vpc_id      = var.vpc_id
 
-  tags = merge({
-    Name    = "${var.project_name}-${each.key}-sg"
-    Project = var.project_name
-  }, var.tags)
+  tags = merge(local.tags, { Name = "${var.project_name}-${each.key}-sg" })
 
   lifecycle {
     create_before_destroy = true
   }
 }
 
-resource "aws_vpc_security_group_ingress_rule" "intra_tcp" {
-  for_each = { for k, v in local.tcp_rules : k => v if contains(keys(var.node_groups), v.group) }
+resource "aws_vpc_security_group_ingress_rule" "vpc" {
+  for_each = local.vpc_rules
 
   security_group_id = aws_security_group.node[each.value.group].id
-  description       = "TCP ${each.value.port} from within the VPC"
+  description       = "${upper(each.value.protocol)} ${each.value.port} from the VPC"
   cidr_ipv4         = var.vpc_cidr
   from_port         = each.value.port
   to_port           = each.value.port
-  ip_protocol       = "tcp"
-  tags = merge({
-    Name    = "${var.project_name}-${each.value.group}-intra-tcp-ingress"
-    Project = var.project_name
-  }, var.tags)
+  ip_protocol       = each.value.protocol
 }
 
-resource "aws_vpc_security_group_ingress_rule" "intra_udp" {
-  for_each = { for k, v in local.udp_rules : k => v if contains(keys(var.node_groups), v.group) }
+# Tasks and sidecars on one worker must be reachable from the others and from the ALB.
+resource "aws_vpc_security_group_ingress_rule" "worker_workloads" {
+  for_each = toset(local.has_workers ? ["tcp", "udp"] : [])
 
-  security_group_id = aws_security_group.node[each.value.group].id
-  description       = "UDP ${each.value.port} from within the VPC"
+  security_group_id = aws_security_group.node["nomad_worker"].id
+  description       = "Nomad dynamic ports (${each.value}) from the VPC"
   cidr_ipv4         = var.vpc_cidr
+  from_port         = local.ports.workload.min
+  to_port           = local.ports.workload.max
+  ip_protocol       = each.value
+}
+
+resource "aws_vpc_security_group_ingress_rule" "federation" {
+  for_each = local.peer_rules
+
+  security_group_id = aws_security_group.node["nomad_consul_server"].id
+  description       = "${upper(each.value.protocol)} ${each.value.port} from peer site ${each.value.cidr}"
+  cidr_ipv4         = each.value.cidr
   from_port         = each.value.port
   to_port           = each.value.port
-  ip_protocol       = "udp"
-  tags = merge({
-    Name    = "${var.project_name}-${each.value.group}-intra-udp-ingress"
-    Project = var.project_name
-  }, var.tags)
+  ip_protocol       = each.value.protocol
+}
+
+# SSH is reachable only from the Boundary worker, never from a CIDR.
+resource "aws_vpc_security_group_ingress_rule" "ssh_from_boundary" {
+  for_each = local.has_boundary ? var.node_groups : {}
+
+  security_group_id            = aws_security_group.node[each.key].id
+  description                  = "SSH from the Boundary worker"
+  referenced_security_group_id = aws_security_group.node["boundary"].id
+  from_port                    = local.ports.ssh
+  to_port                      = local.ports.ssh
+  ip_protocol                  = "tcp"
+}
+
+# The worker proxy is not HTTP, so clients reach it directly instead of through the ALB.
+resource "aws_vpc_security_group_ingress_rule" "boundary_proxy_clients" {
+  for_each = toset(local.has_boundary ? var.allowed_client_cidrs : [])
+
+  security_group_id = aws_security_group.node["boundary"].id
+  description       = "Boundary worker proxy from ${each.value}"
+  cidr_ipv4         = each.value
+  from_port         = local.ports.boundary.proxy
+  to_port           = local.ports.boundary.proxy
+  ip_protocol       = "tcp"
+}
+
+resource "aws_vpc_security_group_ingress_rule" "rds_from_boundary" {
+  count = local.has_boundary && var.create_rds_ingress_rule ? 1 : 0
+
+  security_group_id            = var.boundary_db_security_group_id
+  description                  = "Boundary controllers to Postgres"
+  referenced_security_group_id = aws_security_group.node["boundary"].id
+  from_port                    = 5432
+  to_port                      = 5432
+  ip_protocol                  = "tcp"
+
+  lifecycle {
+    precondition {
+      condition     = var.boundary_db_security_group_id != null
+      error_message = "Set boundary_db_security_group_id, or set create_rds_ingress_rule = false."
+    }
+  }
 }
 
 resource "aws_vpc_security_group_egress_rule" "all" {
@@ -241,74 +285,7 @@ resource "aws_vpc_security_group_egress_rule" "all" {
   description       = "All egress"
   cidr_ipv4         = "0.0.0.0/0"
   ip_protocol       = "-1"
-
-  tags = merge({
-    Name    = "${var.project_name}-${each.key}-egress-rule"
-    Project = var.project_name
-  }, var.tags)
 }
-
-## Boundary reaches Postgres.
-resource "aws_vpc_security_group_ingress_rule" "rds_from_boundary" {
-  count = var.create_rds_ingress_rule ? 1 : 0
-
-  security_group_id            = var.boundary_db_security_group_id
-  description                  = "Boundary controllers to Postgres"
-  referenced_security_group_id = aws_security_group.node["boundary"].id
-  from_port                    = 5432
-  to_port                      = 5432
-  ip_protocol                  = "tcp"
-
-  tags = merge({
-    Name    = "${var.project_name}-rds-boundary-ingress"
-    Project = var.project_name
-  }, var.tags)
-}
-
-
-# Security group on the external NLB itself. Client IP preservation is disabled
-# on the external target groups, so the instance SG sees the NLB, not the client.
-resource "aws_security_group" "nlb_external" {
-  name_prefix = "${var.project_name}-nlb-ext-"
-  description = "Internet-facing NLB"
-  vpc_id      = var.vpc_id
-
-  tags = merge({
-    Name    = "${var.project_name}-nlb-ext-sg",
-    Project = var.project_name
-  }, var.tags)
-
-  lifecycle {
-    create_before_destroy = true
-  }
-}
-
-resource "aws_vpc_security_group_ingress_rule" "nlb_external_clients" {
-  for_each = {
-    for pair in setproduct(keys(local.external_services), var.allowed_client_cidrs) :
-    "${pair[0]}-${pair[1]}" => { port = local.external_services[pair[0]].port, cidr = pair[1] }
-  }
-
-  security_group_id = aws_security_group.nlb_external.id
-  description       = "Boundary ${each.value.port} from ${each.value.cidr}"
-  cidr_ipv4         = each.value.cidr
-  from_port         = each.value.port
-  to_port           = each.value.port
-  ip_protocol       = "tcp"
-
-  tags = merge({
-    Name    = "${var.project_name}-${each.key}-nlb-ext-ingress"
-    Project = var.project_name
-  }, var.tags)
-}
-
-resource "aws_vpc_security_group_egress_rule" "nlb_external_to_targets" {
-  security_group_id            = aws_security_group.nlb_external.id
-  description                  = "NLB to Boundary instances"
-  referenced_security_group_id = aws_security_group.node["boundary"].id
-  ip_protocol                  = "-1"
-}
-
 
 ## IAM
 resource "aws_iam_role" "node" {
@@ -316,10 +293,8 @@ resource "aws_iam_role" "node" {
 
   name_prefix        = "${var.project_name}-${each.key}-"
   assume_role_policy = data.aws_iam_policy_document.assume.json
-  tags = merge({
-    Project = var.project_name
-    Name    = "${var.project_name}-${each.key}-iam-role"
-  }, var.tags)
+
+  tags = merge(local.tags, { Name = "${var.project_name}-${each.key}-role" })
 }
 
 resource "aws_iam_instance_profile" "node" {
@@ -328,16 +303,12 @@ resource "aws_iam_instance_profile" "node" {
   name_prefix = "${var.project_name}-${each.key}-"
   role        = aws_iam_role.node[each.key].name
 
+  tags = merge(local.tags, { Name = "${var.project_name}-${each.key}-profile" })
+
   lifecycle {
     create_before_destroy = true
   }
-
-  tags = merge({
-    Project = var.project_name
-    Name    = "${var.project_name}-${each.key}-iam-profile"
-  }, var.tags)
 }
-
 
 resource "aws_iam_role_policy" "autojoin" {
   for_each = var.node_groups
@@ -347,81 +318,122 @@ resource "aws_iam_role_policy" "autojoin" {
   policy      = data.aws_iam_policy_document.autojoin.json
 }
 
-resource "aws_iam_role_policy" "vault_unseal" {
-  count = contains(keys(var.node_groups), "vault") ? 1 : 0
+resource "aws_iam_role_policy" "vault" {
+  count = local.has_vault ? 1 : 0
 
-  name_prefix = "vault-unseal-"
+  name_prefix = "vault-"
   role        = aws_iam_role.node["vault"].id
-  policy      = data.aws_iam_policy_document.vault_unseal.json
+  policy      = data.aws_iam_policy_document.vault[0].json
+}
+
+resource "aws_iam_role_policy" "vault_bootstrap" {
+  count = var.enable_bootstrap_automation && local.has_vault ? 1 : 0
+
+  name_prefix = "vault-bootstrap-"
+  role        = aws_iam_role.node["vault"].id
+  policy      = data.aws_iam_policy_document.vault_bootstrap[0].json
 }
 
 resource "aws_iam_role_policy" "boundary" {
-  count = contains(keys(var.node_groups), "boundary") ? 1 : 0
+  count = local.has_boundary ? 1 : 0
 
   name_prefix = "boundary-"
   role        = aws_iam_role.node["boundary"].id
-  policy      = data.aws_iam_policy_document.boundary.json
+  policy      = data.aws_iam_policy_document.boundary[0].json
+}
+
+resource "aws_iam_role_policy" "boundary_bootstrap" {
+  count = var.enable_bootstrap_automation && local.has_boundary ? 1 : 0
+
+  name_prefix = "boundary-bootstrap-"
+  role        = aws_iam_role.node["boundary"].id
+  policy      = data.aws_iam_policy_document.boundary_bootstrap[0].json
 }
 
 resource "aws_iam_role_policy_attachment" "ssm" {
   for_each = var.enable_ssm ? var.node_groups : {}
 
   role       = aws_iam_role.node[each.key].name
-  policy_arn = "arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore"
+  policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
 }
 
+## Bootstrap automation
+resource "aws_dynamodb_table" "bootstrap_lock" {
+  count = var.enable_bootstrap_automation && (local.has_vault || local.has_boundary) ? 1 : 0
 
-resource "aws_iam_role_policy" "bootstrap_boundary" {
-  count = var.enable_bootstrap_automation && contains(keys(var.node_groups), "boundary") ? 1 : 0
+  name         = "${var.project_name}-bootstrap-lock"
+  billing_mode = "PAY_PER_REQUEST"
+  hash_key     = "LockId"
 
-  name_prefix = "boundary-bootstrap-"
-  role        = aws_iam_role.node["boundary"].id
-  policy      = data.aws_iam_policy_document.bootstrap_boundary[0].json
+  attribute {
+    name = "LockId"
+    type = "S"
+  }
+
+  tags = local.tags
 }
 
-resource "aws_iam_role_policy" "bootstrap_vault" {
-  count = var.enable_bootstrap_automation && contains(keys(var.node_groups), "vault") ? 1 : 0
+resource "aws_secretsmanager_secret" "vault_init" {
+  count = var.enable_bootstrap_automation && local.has_vault ? 1 : 0
 
-  name_prefix = "vault-bootstrap-"
-  role        = aws_iam_role.node["vault"].id
-  policy      = data.aws_iam_policy_document.bootstrap_vault[0].json
+  name_prefix             = "${var.project_name}/vault/init-"
+  description             = "Vault recovery keys and initial root token"
+  kms_key_id              = var.kms_key_arns.vault_unseal
+  recovery_window_in_days = 7
+
+  tags = local.tags
 }
 
+resource "aws_secretsmanager_secret" "boundary_init" {
+  count = var.enable_bootstrap_automation && local.has_boundary ? 1 : 0
 
-## Launch Template
+  name_prefix             = "${var.project_name}/boundary/init-"
+  description             = "Boundary initial admin credentials and auth method ID"
+  kms_key_id              = var.kms_key_arns.boundary_root
+  recovery_window_in_days = 7
+
+  tags = local.tags
+}
+
+## Launch templates
 resource "aws_launch_template" "node" {
   for_each = var.node_groups
 
   name_prefix   = "${var.project_name}-${each.key}-"
-  image_id      = local.ami_by_group[each.key]
+  image_id      = data.aws_ami.node[each.key].id
   instance_type = each.value.instance_type
-  key_name      = var.key_name
 
-  vpc_security_group_ids = concat(
-    [aws_security_group.node[each.key].id],
-    lookup(var.additional_security_group_ids, each.key, [])
-  )
+  # No key_name on purpose: there is no key pair to attach.
+
+  # Top-level security groups and network_interfaces are mutually exclusive.
+  vpc_security_group_ids = each.value.public_ip ? null : [aws_security_group.node[each.key].id]
+
+  dynamic "network_interfaces" {
+    for_each = each.value.public_ip ? [1] : []
+    content {
+      device_index                = 0
+      associate_public_ip_address = true
+      security_groups             = [aws_security_group.node[each.key].id]
+      delete_on_termination       = true
+    }
+  }
 
   iam_instance_profile {
     arn = aws_iam_instance_profile.node[each.key].arn
   }
 
+  # Hop limit 1 keeps bridged containers away from the node's role credentials.
   metadata_options {
     http_endpoint               = "enabled"
-    http_tokens                 = var.enable_imdsv2_only ? "required" : "optional"
-    http_put_response_hop_limit = 2
-    instance_metadata_tags      = "enabled"
-  }
-
-  monitoring {
-    enabled = each.value.detailed_monitoring
+    http_tokens                 = "required"
+    http_put_response_hop_limit = 1
   }
 
   block_device_mappings {
-    device_name = "/dev/sda1"
+    device_name = data.aws_ami.node[each.key].root_device_name
     ebs {
       volume_size           = each.value.root_volume_size
-      volume_type           = each.value.root_volume_type
+      volume_type           = "gp3"
       encrypted             = true
       kms_key_id            = var.kms_key_arns.ebs
       delete_on_termination = true
@@ -429,13 +441,12 @@ resource "aws_launch_template" "node" {
   }
 
   dynamic "block_device_mappings" {
-    for_each = each.value.data_volume_size == null ? [] : [each.value]
+    for_each = each.value.data_volume_size == null ? [] : [each.value.data_volume_size]
     content {
       device_name = "/dev/sdf"
       ebs {
-        volume_size           = block_device_mappings.value.data_volume_size
-        volume_type           = block_device_mappings.value.data_volume_type
-        iops                  = block_device_mappings.value.data_volume_iops
+        volume_size           = block_device_mappings.value
+        volume_type           = "gp3"
         encrypted             = true
         kms_key_id            = var.kms_key_arns.ebs
         delete_on_termination = true
@@ -443,102 +454,39 @@ resource "aws_launch_template" "node" {
     }
   }
 
-  user_data = base64encode(templatefile("${path.module}/templates/user_data.sh.tftpl", {
-    role                 = each.key
-    project_name         = var.project_name
-    consul_datacenter    = var.consul_datacenter
-    retry_join_tag_key   = var.retry_join_tag_key
-    retry_join_tag_val   = var.project_name
-    bootstrap_expect     = var.bootstrap_expect
-    private_zone_name    = var.private_zone_name
-    service_hostnames    = var.service_hostnames
-    vault_kms_key_id     = var.kms_key_arns.vault_unseal
-    boundary_kms         = var.kms_key_arns
-    ports                = local.ports
-    extra                = each.value.extra_user_data
-    boundary_db          = var.boundary_db
-    boundary_public_addr = aws_lb.external.dns_name
-    bootstrap_enabled    = var.enable_bootstrap_automation
-    lock_table           = try(aws_dynamodb_table.bootstrap_lock[0].name, "")
-    vault_init_secret    = try(aws_secretsmanager_secret.vault_init[0].arn, "")
-    boundary_init_secret = try(aws_secretsmanager_secret.boundary_init[0].arn, "")
-  }))
+  # Assembled per role: shared prelude, the lock library (vault and boundary
+  # only), the role's own script, then any extra_user_data for the group.
+  user_data = base64encode(join("\n", compact([
+    templatefile("${path.module}/templates/common.sh.tftpl", { role = each.key }),
+    contains(local.bootstrap_roles, each.key) ? templatefile("${path.module}/templates/bootstrap_lock.sh.tftpl", { lock_table = local.lock_table }) : "",
+    templatefile("${path.module}/templates/${each.key}.sh.tftpl", local.user_data_vars[each.key]),
+    each.value.extra_user_data,
+    "echo \"==> user-data complete for ${each.key}\"",
+  ])))
 
   tag_specifications {
     resource_type = "instance"
-    tags = merge(var.tags, each.value.extra_tags, {
-      Name                     = "${var.project_name}-${each.key}"
-      Role                     = each.key
-      (var.retry_join_tag_key) = var.project_name
-    })
+    tags          = local.instance_tags[each.key]
   }
 
   tag_specifications {
     resource_type = "volume"
-    tags          = merge(var.tags, { Name = "${var.project_name}-${each.key}", Project = var.project_name })
+    tags          = merge(local.tags, { Name = "${var.project_name}-${each.key}" })
   }
+
+  tags = merge(local.tags, { Name = "${var.project_name}-${each.key}-lt" })
 
   lifecycle {
     create_before_destroy = true
   }
 }
 
-## Target groups
-resource "aws_lb_target_group" "internal" {
-  for_each = local.internal_services
-
-  name_prefix          = substr("${each.key}-", 0, 6)
-  vpc_id               = var.vpc_id
-  port                 = each.value.port
-  protocol             = "TCP"
-  target_type          = "instance"
-  deregistration_delay = var.target_group_deregistration_delay
-
-  health_check {
-    protocol            = "TCP"
-    healthy_threshold   = 2
-    unhealthy_threshold = 2
-    interval            = 10
-  }
-
-  tags = merge(var.tags, { Name = "${var.project_name}-${each.key}-tg", Project = var.project_name })
-
-  lifecycle {
-    create_before_destroy = true
-  }
-}
-
-resource "aws_lb_target_group" "external" {
-  for_each = local.external_services
-
-  name_prefix          = substr("bnd${each.key}", 0, 6)
-  vpc_id               = var.vpc_id
-  port                 = each.value.port
-  protocol             = "TCP"
-  target_type          = "instance"
-  preserve_client_ip   = false
-  deregistration_delay = var.target_group_deregistration_delay
-
-  health_check {
-    protocol            = "TCP"
-    healthy_threshold   = 2
-    unhealthy_threshold = 2
-    interval            = 10
-  }
-
-  tags = merge(var.tags, { Name = "${var.project_name}-boundary-${each.key}-ext-tg", Project = var.project_name })
-
-  lifecycle {
-    create_before_destroy = true
-  }
-}
-
-## Auto Scaling groups - ASG
+## Auto Scaling groups
 resource "aws_autoscaling_group" "node" {
   for_each = var.node_groups
 
   name_prefix         = "${var.project_name}-${each.key}-"
-  vpc_zone_identifier = var.private_subnet_ids
+  vpc_zone_identifier = each.value.public_ip ? var.public_subnet_ids : var.private_subnet_ids
 
   min_size         = each.value.min_size
   max_size         = each.value.max_size
@@ -548,10 +496,7 @@ resource "aws_autoscaling_group" "node" {
   health_check_grace_period = each.value.health_check_grace_period
   termination_policies      = ["OldestLaunchTemplate", "OldestInstance"]
 
-  target_group_arns = concat(
-    [for k, s in local.internal_services : aws_lb_target_group.internal[k].arn if s.group == each.key],
-    each.key == "boundary" ? [for k in keys(local.external_services) : aws_lb_target_group.external[k].arn] : []
-  )
+  target_group_arns = lookup(var.target_group_arns, each.key, [])
 
   dynamic "launch_template" {
     for_each = each.value.spot_enabled ? [] : [1]
@@ -562,13 +507,12 @@ resource "aws_autoscaling_group" "node" {
   }
 
   dynamic "mixed_instances_policy" {
-    for_each = each.value.spot_enabled ? [each.value] : []
+    for_each = each.value.spot_enabled ? [1] : []
     content {
       instances_distribution {
-        on_demand_base_capacity                  = mixed_instances_policy.value.on_demand_base_count
+        on_demand_base_capacity                  = 0
         on_demand_percentage_above_base_capacity = 0
         spot_allocation_strategy                 = "price-capacity-optimized"
-        spot_max_price                           = mixed_instances_policy.value.spot_max_price
       }
       launch_template {
         launch_template_specification {
@@ -584,6 +528,7 @@ resource "aws_autoscaling_group" "node" {
     content {
       strategy = "Rolling"
       preferences {
+        # Two of three raft members stay up during a roll.
         min_healthy_percentage = 66
         instance_warmup        = each.value.health_check_grace_period
       }
@@ -591,12 +536,7 @@ resource "aws_autoscaling_group" "node" {
   }
 
   dynamic "tag" {
-    for_each = merge(var.tags, each.value.extra_tags, {
-      Name                     = "${var.project_name}-${each.key}"
-      Role                     = each.key
-      Project                  = var.project_name
-      (var.retry_join_tag_key) = var.project_name
-    })
+    for_each = local.instance_tags[each.key]
     content {
       key                 = tag.key
       value               = tag.value
@@ -606,137 +546,22 @@ resource "aws_autoscaling_group" "node" {
 
   lifecycle {
     create_before_destroy = true
-    ignore_changes        = [desired_capacity]
+    # A failover script scales groups with the AWS CLI; Terraform must not undo it.
+    ignore_changes = [desired_capacity]
+
+    precondition {
+      condition     = !each.value.public_ip || length(var.public_subnet_ids) > 0
+      error_message = "public_subnet_ids must not be empty when a node group sets public_ip."
+    }
   }
 
-
+  # Instances must not boot before their permissions exist.
   depends_on = [
     aws_iam_role_policy.autojoin,
-    aws_iam_role_policy.vault_unseal,
+    aws_iam_role_policy.vault,
+    aws_iam_role_policy.vault_bootstrap,
     aws_iam_role_policy.boundary,
+    aws_iam_role_policy.boundary_bootstrap,
     aws_iam_role_policy_attachment.ssm,
   ]
-}
-
-## Load balancers
-resource "aws_lb" "internal" {
-  name_prefix        = "int-"
-  internal           = true
-  load_balancer_type = "network"
-  subnets            = var.private_subnet_ids
-
-  enable_cross_zone_load_balancing = var.enable_cross_zone_load_balancing
-  enable_deletion_protection       = var.enable_deletion_protection
-
-  dynamic "access_logs" {
-    for_each = coalesce(var.nlb_access_logs.enabled, false) ? [var.nlb_access_logs] : []
-    content {
-      enabled = true
-      bucket  = access_logs.value.bucket
-      prefix  = access_logs.value.prefix
-    }
-  }
-
-  tags = merge(var.tags, { Name = "${var.project_name}-internal-nlb", Project = var.project_name })
-}
-
-resource "aws_lb" "external" {
-  name_prefix        = "ext-"
-  internal           = false
-  load_balancer_type = "network"
-  subnets            = var.public_subnet_ids
-  security_groups    = [aws_security_group.nlb_external.id]
-
-  enable_cross_zone_load_balancing = var.enable_cross_zone_load_balancing
-  enable_deletion_protection       = var.enable_deletion_protection
-
-  dynamic "access_logs" {
-    for_each = coalesce(var.nlb_access_logs.enabled, false) ? [var.nlb_access_logs] : []
-    content {
-      enabled = true
-      bucket  = access_logs.value.bucket
-      prefix  = access_logs.value.prefix
-    }
-  }
-
-  tags = merge(var.tags, { Name = "${var.project_name}-external-nlb", Project = var.project_name })
-}
-
-resource "aws_lb_listener" "internal" {
-  for_each = local.internal_services
-
-  load_balancer_arn = aws_lb.internal.arn
-  port              = each.value.port
-  protocol          = "TCP"
-
-  default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.internal[each.key].arn
-  }
-}
-
-resource "aws_lb_listener" "external" {
-  for_each = local.external_services
-
-  load_balancer_arn = aws_lb.external.arn
-  port              = each.value.port
-  protocol          = "TCP"
-
-  default_action {
-    type             = "forward"
-    target_group_arn = aws_lb_target_group.external[each.key].arn
-  }
-}
-
-## Private DNS
-resource "aws_route53_record" "service" {
-  for_each = local.internal_services
-
-  zone_id = var.private_zone_id
-  name    = "${each.value.hostname}.${var.private_zone_name}"
-  type    = "A"
-
-  alias {
-    name                   = aws_lb.internal.dns_name
-    zone_id                = aws_lb.internal.zone_id
-    evaluate_target_health = true
-  }
-}
-
-## Bootstrap Automation
-resource "aws_dynamodb_table" "bootstrap_lock" {
-  count = var.enable_bootstrap_automation ? 1 : 0
-
-  name         = "${var.project_name}-bootstrap-lock"
-  billing_mode = "PAY_PER_REQUEST"
-  hash_key     = "LockId"
-
-  attribute {
-    name = "LockId"
-    type = "S"
-  }
-
-  tags = merge({ Project = var.project_name }, var.tags)
-}
-
-resource "aws_secretsmanager_secret" "vault_init" {
-  count = var.enable_bootstrap_automation ? 1 : 0
-
-  name_prefix             = "${var.project_name}/vault/init-"
-  description             = "Vault recovery keys and initial root token"
-  kms_key_id              = var.kms_key_arns.vault_unseal
-  recovery_window_in_days = 7
-
-  tags = merge({ Project = var.project_name }, var.tags)
-}
-
-resource "aws_secretsmanager_secret" "boundary_init" {
-  count = var.enable_bootstrap_automation ? 1 : 0
-
-  name_prefix             = "${var.project_name}/boundary/init-"
-  description             = "Boundary initial admin credentials and auth method ID"
-  kms_key_id              = var.kms_key_arns.boundary_root
-  recovery_window_in_days = 7
-
-  tags = merge({ Project = var.project_name }, var.tags)
 }

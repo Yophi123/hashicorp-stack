@@ -1,0 +1,167 @@
+## Vault (integrated raft, awskms auto-unseal, registered in Consul)
+
+# Consul client: gives this node .consul DNS and lets Vault register itself.
+
+install -d -o consul -g consul -m 0750 /opt/consul /etc/consul.d
+
+cat > /etc/consul.d/consul.hcl <<EOF
+datacenter = "${consul_datacenter}"
+data_dir   = "/opt/consul"
+log_level  = "INFO"
+node_name  = "$${INSTANCE_ID}"
+server     = false
+
+bind_addr      = "$${PRIVATE_IP}"
+advertise_addr = "$${PRIVATE_IP}"
+client_addr    = "127.0.0.1"
+
+retry_join = ["provider=aws region=$${REGION} tag_key=${join_tag_key} tag_value=${consul_join_tag}"]
+EOF
+
+chown -R consul:consul /etc/consul.d
+start_service consul
+
+# Vault
+systemctl stop vault 2>/dev/null || true
+mount_data_volume /opt/vault
+install -d -o vault -g vault -m 0750 /opt/vault/data /etc/vault.d
+chown -R vault:vault /opt/vault
+
+cat > /etc/vault.d/vault.hcl <<EOF
+ui            = true
+cluster_name  = "${project_name}"
+disable_mlock = true   # recommended with integrated storage
+
+storage "raft" {
+  path    = "/opt/vault/data"
+  node_id = "$${INSTANCE_ID}"
+
+  retry_join {
+    auto_join        = "provider=aws region=$${REGION} tag_key=${join_tag_key} tag_value=${vault_join_tag}"
+    auto_join_scheme = "http"
+    auto_join_port   = ${ports.vault.api}
+  }
+}
+
+listener "tcp" {
+  address         = "0.0.0.0:${ports.vault.api}"
+  cluster_address = "0.0.0.0:${ports.vault.cluster}"
+  tls_disable     = true
+}
+
+seal "awskms" {
+  region     = "$${REGION}"
+  kms_key_id = "${vault_kms_key_id}"
+}
+
+# Publishes vault.service.consul, plus active. and standby. variants.
+service_registration "consul" {
+  address = "127.0.0.1:${ports.consul.http}"
+}
+
+api_addr     = "http://$${PRIVATE_IP}:${ports.vault.api}"
+cluster_addr = "http://$${PRIVATE_IP}:${ports.vault.cluster}"
+EOF
+
+chown -R vault:vault /etc/vault.d
+start_service vault
+
+%{ if bootstrap_enabled ~}
+# One-time init. Terraform interpolates into the quoted heredoc below; bash
+# does not, so everything written as $${...} expands when the script runs.
+cat > /usr/local/bin/vault-bootstrap.sh <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+source /etc/hashistack/bootstrap.env
+source /usr/local/lib/hashistack/lock.sh
+
+export VAULT_ADDR="http://127.0.0.1:${ports.vault.api}"
+INIT_SECRET="${vault_init_secret}"
+
+vault_initialized() {
+  local out
+  out="$(vault status -format=json 2>/dev/null || true)"
+  grep -q '"initialized": true' <<<"$${out}"
+}
+
+# vault status exit codes: 0 unsealed, 2 sealed (but listening), 1 unreachable.
+for _ in $(seq 1 60); do
+  rc=0
+  vault status >/dev/null 2>&1 || rc=$?
+  [ "$${rc}" -ne 1 ] && break
+  sleep 5
+done
+
+init_vault() {
+  # Re-check under the lock. A node that already joined, or a cluster whose
+  # keys are already in Secrets Manager, must never be initialized again.
+  if vault_initialized || secret_has_value "$${INIT_SECRET}"; then
+    echo "==> vault already initialized, skipping"
+    return 0
+  fi
+
+  local init_json
+  # Auto-unseal means these are recovery keys, not unseal keys.
+  init_json="$(vault operator init \
+    -recovery-shares=5 \
+    -recovery-threshold=3 \
+    -format=json)"
+
+  aws secretsmanager put-secret-value \
+    --region "$${REGION}" \
+    --secret-id "$${INIT_SECRET}" \
+    --secret-string "$${init_json}" >/dev/null
+  echo "==> vault initialized, credentials written to Secrets Manager"
+
+%{ if vault_node_count >= 3 ~}
+  # Dead-server cleanup needs min-quorum >= 3, so it is skipped on smaller
+  # clusters. Autopilot is runtime config set through the API.
+  VAULT_TOKEN="$(jq -r .root_token <<<"$${init_json}")"
+  export VAULT_TOKEN
+  for _ in $(seq 1 30); do
+    if vault operator raft autopilot set-config \
+        -cleanup-dead-servers=true \
+        -dead-server-last-contact-threshold=10m \
+        -min-quorum=${vault_node_count} >/dev/null 2>&1; then
+      echo "==> autopilot configured"
+      break
+    fi
+    sleep 5
+  done
+  unset VAULT_TOKEN
+%{ endif ~}
+}
+
+if vault_initialized; then
+  echo "==> already initialized, nothing to do"
+  exit 0
+fi
+
+run_once vault-init init_vault
+SCRIPT
+chmod 0755 /usr/local/bin/vault-bootstrap.sh
+
+cat > /etc/systemd/system/vault-bootstrap.service <<EOF
+[Unit]
+Description=One-time Vault initialization
+Wants=network-online.target
+After=vault.service network-online.target
+Requires=vault.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=40min
+ExecStart=/usr/local/bin/vault-bootstrap.sh
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+systemctl daemon-reload
+systemctl enable vault-bootstrap.service
+systemctl restart vault
+# --no-block: nodes that lose the election wait up to 30 min in run_once,
+# and that should not hold cloud-init hostage.
+systemctl start --no-block vault-bootstrap.service
+%{ endif ~}

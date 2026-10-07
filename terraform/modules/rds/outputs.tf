@@ -34,25 +34,27 @@ output "kms_key_id" {
 }
 
 output "master_user_secret_arn" {
-  description = "ARN of the Secrets Manager secret holding the RDS-managed master password."
-  value       = aws_db_instance.this.master_user_secret[0].secret_arn
+  description = "ARN of the Secrets Manager secret holding the master username/password, in either mode."
+  value       = local.master_secret_arn
+  depends_on  = [aws_secretsmanager_secret_version.master]
 }
 
 output "connection" {
-  description = <<-EOT
-    Everything an application needs to build its own connection string at
-    boot. The password is deliberately absent — it lives only in the managed
-    secret, and consumers read it at runtime with the instance profile.
-  EOT
+  description = "Host, port, database name and secret ARN for applications to build a connection string."
   value = {
     host       = aws_db_instance.this.address
     port       = aws_db_instance.this.port
     dbname     = aws_db_instance.this.db_name
-    secret_arn = aws_db_instance.this.master_user_secret[0].secret_arn
+    secret_arn = local.master_secret_arn
   }
+  depends_on = [aws_secretsmanager_secret_version.master]
 }
 
 output "master_user_secret_kms_key_id" {
-  description = "KMS key encrypting the managed master secret. Consumers need kms:Decrypt on it."
-  value       = aws_db_instance.this.master_user_secret[0].kms_key_id
+  description = "KMS key encrypting the master secret. Null means the AWS-managed aws/secretsmanager key."
+  value = (
+    var.manage_master_user_password
+    ? aws_db_instance.this.master_user_secret[0].kms_key_id
+    : var.master_secret_kms_key_id
+  )
 }

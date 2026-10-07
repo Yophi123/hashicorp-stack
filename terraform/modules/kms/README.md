@@ -1,86 +1,74 @@
-# `kms` — Purpose-Scoped Customer-Managed Keys
+# KMS module
 
-![Terraform](https://img.shields.io/badge/Terraform-AWS%20provider%20~%3E%206.0-7B42BC?logo=terraform&logoColor=white)
-![KMS](https://img.shields.io/badge/AWS%20KMS-symmetric%20CMK-DD344C?logo=amazonaws&logoColor=white)
-![Rotation](https://img.shields.io/badge/rotation-annual%2C%20on%20by%20default-2E7D32)
+![Terraform](https://img.shields.io/badge/Terraform-844FBA?style=for-the-badge&logo=terraform&logoColor=white)
+![AWS KMS](https://img.shields.io/badge/AWS%20KMS-DD344C?style=for-the-badge)
+![Vault](https://img.shields.io/badge/Vault-FFEC6E?style=for-the-badge&logo=vault&logoColor=black)
+![Boundary](https://img.shields.io/badge/Boundary-EC585D?style=for-the-badge&logo=hashicorp&logoColor=white)
 
-This is a deliberately small module: **one symmetric customer-managed key (CMK) plus one alias per instantiation**. The platform calls it once for each cryptographic purpose instead of sharing a single key. Each key's blast radius, audit trail (CloudTrail `kms:*` events) and IAM grants therefore stay independent.
+A deliberately small module: one symmetric customer-managed key and one alias
+per call. The platform calls it once for each cryptographic purpose instead of
+sharing a single key, so each key's blast radius, audit trail and IAM grants
+stay independent.
 
-> Back to the [platform README](../../../README.md).
+## Keys in this platform
 
----
+| Alias | Root module | Used by | Protects | If lost or disabled |
+|---|---|---|---|---|
+| `vault-unseal` | `kms_vault_unseal` | Vault's `awskms` seal, and the Vault init secret | Vault's root key, and so every secret in Vault. Also the recovery keys and initial root token. | Vault cannot unseal. Its data is unrecoverable. |
+| `boundary-root` | `kms_boundary_root` | Boundary controller, and the Boundary init secret | The keys that encrypt credentials and session data in Postgres. | Boundary cannot read its database. |
+| `boundary-worker-auth` | `kms_boundary_worker` | Boundary controller and worker | Worker registration and authentication. | Workers cannot join; sessions fail. |
+| `boundary-recovery` | `kms_boundary_recovery` | Operators, as break-glass | Recovery access to the API when the auth method or admin login is broken. | No break-glass path. Normal operation is unaffected. |
 
-## Contents
+## What it creates
 
-- [Key Hierarchy in This Platform](#key-hierarchy-in-this-platform)
-- [Usage](#usage)
-- [Inputs](#inputs)
-- [Outputs](#outputs)
-- [Design Decisions](#design-decisions)
-- [Key Policy](#key-policy)
-- [Multi-Region / DR Considerations](#multi-region--dr-considerations)
-- [Operations](#operations)
-- [Known Limitations](#known-limitations)
+- One symmetric KMS key, single-region by default, with annual rotation enabled
+- One alias, `alias/<alias>`, pointing at the key
 
----
+## Design decisions
 
-## Key Hierarchy in This Platform
-
-```mermaid
-flowchart LR
-    subgraph KMS["AWS KMS (per region)"]
-        k1{{"alias/vault-unseal"}}
-        k2{{"alias/boundary-root"}}
-        k3{{"alias/boundary-worker-auth"}}
-        k4{{"alias/boundary-recovery"}}
-    end
-
-    subgraph Vault["Vault raft cluster"]
-        seal["seal &quot;awskms&quot;<br/>wraps the root key"]
-    end
-    subgraph Boundary["Boundary controllers + workers"]
-        root["kms &quot;aws&quot; purpose=root<br/>wraps per-scope DEKs in Postgres"]
-        wa["purpose=worker-auth<br/>worker ↔ controller identity"]
-        rec["purpose=recovery<br/>break-glass API access"]
-    end
-    sm1[("Secrets Manager<br/>vault/init-*")]
-    sm2[("Secrets Manager<br/>boundary/init-*")]
-
-    k1 --> seal
-    k1 -. encrypts .-> sm1
-    k2 --> root
-    k2 -. encrypts .-> sm2
-    k3 --> wa
-    k4 --> rec
-```
-
-| Alias | Consumer | What it protects | If lost or disabled |
-| :-- | :-- | :-- | :-- |
-| `vault-unseal` | Vault `seal "awskms"`, `vault/init-*` secret | Vault's root key, and so every secret in Vault. Also the bootstrap recovery keys and root token. | Vault **cannot unseal**. Data is unrecoverable without the key. |
-| `boundary-root` | Boundary controllers, `boundary/init-*` secret | Per-scope data-encryption keys that wrap credentials, host-catalog secrets and session data stored in Postgres. | Boundary **cannot decrypt its database**. |
-| `boundary-worker-auth` | Boundary controllers + workers | Worker registration and authentication to controllers. | Workers cannot join. Sessions fail. |
-| `boundary-recovery` | Operators (break-glass) | Recovery-mode API access when the auth method or admin credentials are broken. | No break-glass path. Normal operation is unaffected. |
-
----
+- **One key per purpose.** Boundary requires separate root, worker-auth and
+  recovery keys. The separation is also useful: the recovery key can be locked
+  to a break-glass role, and replacing a compromised worker-auth key does not
+  touch the encrypted database.
+- **Rotation on by default.** KMS keeps every earlier version of the key
+  material, so data encrypted before a rotation still decrypts. Neither Vault
+  nor Boundary needs a restart or a re-wrap.
+- **30-day deletion window.** Deleting `vault-unseal` or `boundary-root` makes
+  that product's data permanently unreadable. The longest window gives the most
+  time to notice and cancel.
+- **Default key policy, access granted through IAM.** With no policy passed, AWS
+  delegates control to IAM, and the `ec2` module grants each instance role only
+  the actions it needs on only its own keys.
+- **Multi-region is opt-in and permanent.** It can only be chosen when a key is
+  created, so it is decided per key up front.
 
 ## Usage
-
-As used in [`terraform/main.tf`](../../main.tf):
 
 ```hcl
 module "kms_vault_unseal" {
   source       = "./modules/kms"
-  project_name = "hashicorp-stack"
+  project_name = var.project_name
   alias        = "vault-unseal"
+  multi_region = true
 }
 
 module "kms_boundary_root" {
   source       = "./modules/kms"
-  project_name = "hashicorp-stack"
+  project_name = var.project_name
   alias        = "boundary-root"
 }
 
-# ...boundary-worker-auth, boundary-recovery
+module "kms_boundary_worker" {
+  source       = "./modules/kms"
+  project_name = var.project_name
+  alias        = "boundary-worker-auth"
+}
+
+module "kms_boundary_recovery" {
+  source       = "./modules/kms"
+  project_name = var.project_name
+  alias        = "boundary-recovery"
+}
 
 module "ec2" {
   # ...
@@ -93,134 +81,97 @@ module "ec2" {
 }
 ```
 
-With an explicit description and a least-privilege key policy (see [Key Policy](#key-policy)):
-
-```hcl
-module "kms_vault_unseal" {
-  source       = "./modules/kms"
-  project_name = "hashicorp-stack"
-  alias        = "hashicorp-stack/vault-unseal"   # namespaced alias
-  description  = "Vault awskms auto-unseal for hashicorp-stack"
-  policy       = data.aws_iam_policy_document.vault_unseal_key.json
-}
-```
-
----
-
 ## Inputs
 
 | Name | Type | Default | Description |
-| :-- | :-- | :-- | :-- |
-| `project_name` | `string` | — **(required)** | Applied as the `Project` tag. |
-| `alias` | `string` | — **(required)** | Alias without the `alias/` prefix. Must be unique per account and region. Validated against `^[a-zA-Z0-9/_-]+$`. |
-| `description` | `string` | `null` | Key description shown in the console and in CloudTrail. |
-| `deletion_window_in_days` | `number` | `30` | Waiting period after `ScheduleKeyDeletion` (7–30, validated). Keep this at 30 for keys that protect data. |
-| `enable_key_rotation` | `bool` | `true` | Annual automatic rotation of the key material. |
-| `policy` | `string` | `null` | JSON key policy. `null` applies the AWS default policy (see below). |
-| `tags` | `map(string)` | `{}` | Merged with `Project` and `Alias` tags. |
+|---|---|---|---|
+| `project_name` | `string` | required | Applied as the `Project` tag. |
+| `alias` | `string` | required | Alias without the `alias/` prefix. Unique per account and region. |
+| `description` | `string` | `null` | Key description, shown in the console and in CloudTrail. |
+| `deletion_window_in_days` | `number` | `30` | Waiting period before a scheduled deletion takes effect (7 to 30). |
+| `enable_key_rotation` | `bool` | `true` | Rotate the key material automatically once a year. |
+| `multi_region` | `bool` | `false` | Create a multi-region primary key. Cannot be changed after creation. |
+| `policy` | `string` | `null` | JSON key policy. `null` applies the AWS default policy. |
+| `tags` | `map(string)` | `{}` | Merged with the `Project` and `Alias` tags. |
 
 ## Outputs
 
 | Name | Description |
-| :-- | :-- |
-| `key_id` | Key UUID. |
-| `key_arn` | Key ARN. Pass this to Vault/Boundary config and IAM policies. |
+|---|---|
+| `key_id` | Key ID. |
+| `key_arn` | Key ARN. Pass this to the `ec2` module; IAM policies need the key ARN, not the alias ARN. |
 | `alias_name` | `alias/<alias>`. |
 | `alias_arn` | Alias ARN. |
 
----
+## Who can use the keys
 
-## Design Decisions
+Granted by the `ec2` module, per instance role:
 
-**One key per purpose, not one key per platform.**
-Boundary requires distinct `root`, `worker-auth` and `recovery` keys. The separation matters beyond compliance: the recovery key can be locked down to a break-glass role, and revoking a compromised worker-auth key does not touch the encrypted database.
+| Role | Keys | Actions | When |
+|---|---|---|---|
+| `vault` | `vault-unseal` | `kms:Encrypt`, `kms:Decrypt`, `kms:DescribeKey` | always |
+| `vault` | `vault-unseal` | `kms:GenerateDataKey` | bootstrap automation on |
+| `boundary` | `boundary-root`, `boundary-worker-auth`, `boundary-recovery` | `kms:Encrypt`, `kms:Decrypt`, `kms:DescribeKey` | always |
+| `boundary` | `boundary-root` | `kms:GenerateDataKey` | bootstrap automation on |
 
-**Rotation on by default.**
-KMS rotation keeps every prior version of the key material, so ciphertext wrapped before a rotation still decrypts. It is transparent to both Vault auto-unseal and Boundary. No re-wrap or restart is required.
+The first three actions serve Vault's seal and Boundary's KMS configuration,
+which call KMS directly. `GenerateDataKey` is only needed to write the init
+secrets, because Secrets Manager encrypts them under these keys.
 
-**30-day deletion window.**
-Deleting the `vault-unseal` or `boundary-root` key makes Vault or Boundary data **permanently** unrecoverable. The maximum window gives the most time to notice and run `CancelKeyDeletion`.
+For production, a key policy that names the allowed roles explicitly is
+stronger than the default, because an IAM administrator can no longer grant
+themselves use of the key. Pass it through `policy`. A key policy that omits
+both the account root and an admin role makes the key unmanageable, so include
+an administration statement.
 
-**Aliases as the stable handle.**
-Humans and runbooks refer to `alias/vault-unseal`. Terraform wires ARNs. If a key ever has to be replaced, the alias is re-pointed and the ARN change flows through one apply.
+## Disaster recovery
 
----
+KMS keys are regional, which shapes the pilot-light design:
 
-## Key Policy
+- **Vault.** A Raft snapshot taken in the primary region is sealed by the
+  primary `vault-unseal` key. Restoring it in the second region needs the same
+  key material there, which is why that key is multi-region. The replica in the
+  second region is a separate `aws_kms_replica_key` resource that this module
+  does not create yet.
+- **Boundary.** The recovery plan rebuilds Boundary's configuration with
+  Terraform against a new database, so the second region can use its own keys
+  and the Boundary keys stay single-region. Restoring the primary database
+  instead would require `boundary-root` to be multi-region, and that cannot be
+  changed on an existing key.
 
-When `policy = null`, AWS applies its default key policy. That policy grants the account root principal `kms:*`, which **delegates access control to IAM**. This platform relies on that delegation: the `ec2` module grants each instance role only the actions it needs on only the keys it needs.
-
-| Role | Keys | Actions |
-| :-- | :-- | :-- |
-| `vault` | `vault-unseal` | `kms:Encrypt`, `kms:Decrypt`, `kms:DescribeKey`, `kms:GenerateDataKey` |
-| `boundary` | `boundary-root`, `boundary-worker-auth`, `boundary-recovery` | `kms:Encrypt`, `kms:Decrypt`, `kms:DescribeKey`, `kms:GenerateDataKey` |
-
-`Encrypt` and `Decrypt` serve Vault's `awskms` seal and Boundary's KMS wrappers, which call KMS directly. `GenerateDataKey` is needed because the bootstrap init secrets are encrypted under these CMKs. Secrets Manager uses envelope encryption, and on `PutSecretValue` it calls `kms:GenerateDataKey` with the caller's credentials.
-
-For production, consider a **key-policy-enforced** model, so that no IAM administrator can grant themselves use of the key:
-
-```hcl
-data "aws_iam_policy_document" "vault_unseal_key" {
-  statement {
-    sid       = "KeyAdministration"
-    actions   = ["kms:Create*", "kms:Describe*", "kms:Enable*", "kms:List*", "kms:Put*",
-                 "kms:Update*", "kms:Revoke*", "kms:Disable*", "kms:Get*", "kms:Delete*",
-                 "kms:TagResource", "kms:UntagResource", "kms:ScheduleKeyDeletion",
-                 "kms:CancelKeyDeletion"]
-    resources = ["*"]
-    principals { type = "AWS", identifiers = [var.platform_admin_role_arn] }
-  }
-
-  statement {
-    sid       = "VaultUnsealUse"
-    actions   = ["kms:Encrypt", "kms:Decrypt", "kms:DescribeKey", "kms:GenerateDataKey"]
-    resources = ["*"]
-    principals { type = "AWS", identifiers = [module.ec2.iam_role_arns["vault"]] }
-  }
-}
-```
-
-> Be careful: a key policy that omits the account root and any admin principal can make the key **unmanageable**. You would then need AWS Support to recover it.
-
----
-
-## Multi-Region / DR Considerations
-
-KMS keys are regional, which has a direct consequence for the pilot-light DR design in the [platform README](../../../README.md#6-disaster-recovery--failover-runbook):
-
-- **Vault.** A raft snapshot taken in the primary region contains a keyring sealed by the primary `vault-unseal` key. Restoring it in the DR region requires that key to be usable from the DR region. With Vault Enterprise DR replication, the secondary has its own seal and this does not apply.
-- **Boundary.** RDS data restored in the DR region (from a snapshot or a promoted replica) is still wrapped by the primary `boundary-root` key. DR controllers need that same key material to read it.
-
-**Recommendation:** for keys protecting data that must survive a regional failover (`vault-unseal`, `boundary-root`), create them as **multi-Region keys** (`multi_region = true`) and replicate them into the DR region with `aws_kms_replica_key`. Replicas share key material and key ID, so ciphertext decrypts in either region. This module does not expose `multi_region` yet (see [Known Limitations](#known-limitations)).
-
----
-
-## Operations
+## Operating notes
 
 ```bash
 # Inspect a key
 aws kms describe-key --key-id alias/vault-unseal
 aws kms get-key-rotation-status --key-id alias/vault-unseal
 
-# Audit usage (CloudTrail): who has been decrypting with the unseal key?
-aws cloudtrail lookup-events \
-  --lookup-attributes AttributeKey=ResourceName,AttributeValue=<key-arn> \
-  --max-results 20
-
 # Undo an accidental deletion within the window
 aws kms cancel-key-deletion --key-id <key-id>
 aws kms enable-key --key-id <key-id>
 ```
 
-**Before `terraform destroy`:** destroying this module schedules key deletion. Once the window elapses, any Vault raft snapshot or Boundary database backup encrypted under these keys becomes unreadable. Export or re-encrypt anything you need to keep first.
+- **Before `terraform destroy`:** destroying a key schedules its deletion. Once
+  the window passes, any Vault snapshot or Boundary database encrypted under it
+  is unreadable.
+- **Changing `multi_region`:** forces a new key. Only do it before the key
+  protects any data.
 
----
+## Known limitations
 
-## Known Limitations
+- **No replica key resource.** The multi-region primary exists, but the copy in
+  the second region still has to be added.
+- **`vault-unseal` has two jobs.** It seals Vault and also encrypts the secret
+  holding the root token and recovery keys. A dedicated key for the init
+  secrets would separate them.
+- **The reserved `aws/` alias prefix is not rejected.** `alias = "aws/foo"`
+  passes validation and fails at apply.
+- **Default key policy.** Any principal an IAM administrator grants KMS access
+  to can use the keys.
 
-| Item | Impact | Suggested fix |
-| :-- | :-- | :-- |
-| No `multi_region` support | Snapshots and RDS restores cannot be decrypted in a DR region (see above). | Expose `multi_region` and add a companion `aws_kms_replica_key` for the DR provider. |
-| `vault-unseal` also encrypts the `vault/init-*` secret | Mixes two purposes on one key: auto-unseal, and protecting the root token and recovery keys. | Give the bootstrap secrets their own key, or accept this and restrict key use to the Vault role. |
-| Reserved `aws/` prefix not rejected | `alias = "aws/foo"` passes validation and fails at apply. | Add `!startswith(var.alias, "aws/")` to the validation. |
-| Default key policy | Any IAM principal an administrator grants `kms:*` can use the key. | Pass an explicit `policy` (see [Key Policy](#key-policy)). |
+## Requirements
+
+| Name | Version |
+|---|---|
+| Terraform | >= 1.3 |
+| AWS provider | ~> 6.0 |

@@ -33,6 +33,7 @@ source "amazon-ebs" "boundary" {
     Name    = "boundary-server"
     Role    = "boundary-plane"
     BuiltBy = "packer"
+    Project = "hashicorp-stack"
   }
 }
 

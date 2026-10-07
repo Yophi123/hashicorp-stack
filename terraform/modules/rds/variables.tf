@@ -120,3 +120,28 @@ variable "tags" {
   type        = map(string)
   default     = {}
 }
+
+
+# Password config
+variable "manage_master_user_password" {
+  type        = bool
+  description = <<-EOT
+    true:  RDS generates the master password and rotates it in its own
+           Secrets Manager secret (every 7 days by default).
+    false: Terraform generates it once and stores it in a secret this module
+           owns. It never rotates on its own; bump master_password_version.
+  EOT
+  default     = true
+}
+
+variable "master_password_version" {
+  type        = number
+  description = "Only used when manage_master_user_password = false. Increment to rotate the password."
+  default     = 1
+}
+
+variable "master_secret_kms_key_id" {
+  type        = string
+  description = "KMS key for the self-managed secret. Null uses the aws/secretsmanager key."
+  default     = null
+}

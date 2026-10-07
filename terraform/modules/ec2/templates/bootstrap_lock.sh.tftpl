@@ -1,0 +1,91 @@
+## Bootstrap lock (vault + boundary only, when enable_bootstrap_automation)
+#
+# Written to disk rather than kept in this shell, because the one-shot
+# systemd units that use it run outside user-data. Both units source it.
+
+install -d -m 0755 /etc/hashistack /usr/local/lib/hashistack
+
+cat > /etc/hashistack/bootstrap.env <<EOF
+REGION="$${REGION}"
+INSTANCE_ID="$${INSTANCE_ID}"
+LOCK_TABLE="${lock_table}"
+EOF
+chmod 0644 /etc/hashistack/bootstrap.env
+
+cat > /usr/local/lib/hashistack/lock.sh <<'LIB'
+# Sourced, not executed. Expects REGION, INSTANCE_ID and LOCK_TABLE.
+
+# Single-winner election via a DynamoDB conditional put.
+# Returns 0 = acquired, 1 = held by someone else (or already done), 2 = real error.
+acquire_lock() {
+  local lock_id="$${1}" lease="$${LOCK_LEASE_SECONDS:-900}" now err
+  now="$(date +%s)"
+  if err="$(aws dynamodb put-item \
+      --region "$${REGION}" \
+      --table-name "$${LOCK_TABLE}" \
+      --item "{\"LockId\":{\"S\":\"$${lock_id}\"},\"state\":{\"S\":\"in-progress\"},\"holder\":{\"S\":\"$${INSTANCE_ID}\"},\"expires_at\":{\"N\":\"$((now + lease))\"}}" \
+      --condition-expression "attribute_not_exists(LockId) OR (#s = :ip AND expires_at < :now)" \
+      --expression-attribute-names '{"#s":"state"}' \
+      --expression-attribute-values "{\":ip\":{\"S\":\"in-progress\"},\":now\":{\"N\":\"$${now}\"}}" \
+      2>&1 >/dev/null)"; then
+    return 0
+  fi
+  grep -q ConditionalCheckFailedException <<<"$${err}" && return 1
+  echo "==> lock error: $${err}" >&2
+  return 2
+}
+
+# The "done" record is permanent on purpose: it is the marker that stops a
+# replacement node, months later, from initializing a second time.
+mark_lock_done() {
+  aws dynamodb update-item \
+    --region "$${REGION}" \
+    --table-name "$${LOCK_TABLE}" \
+    --key "{\"LockId\":{\"S\":\"$${1}\"}}" \
+    --update-expression "SET #s = :d REMOVE expires_at" \
+    --condition-expression "holder = :me" \
+    --expression-attribute-names '{"#s":"state"}' \
+    --expression-attribute-values "{\":d\":{\"S\":\"done\"},\":me\":{\"S\":\"$${INSTANCE_ID}\"}}" \
+    >/dev/null
+}
+
+lock_state() {
+  aws dynamodb get-item \
+    --region "$${REGION}" \
+    --table-name "$${LOCK_TABLE}" \
+    --key "{\"LockId\":{\"S\":\"$${1}\"}}" \
+    --consistent-read \
+    --query 'Item.state.S' --output text 2>/dev/null || echo None
+}
+
+# run_once <lock_id> <command...>
+# Every node calls this. One runs the command; the rest wait for "done",
+# and take over automatically if the holder's lease expires.
+run_once() {
+  local lock_id="$${1}" rc deadline
+  shift
+  deadline=$(( $(date +%s) + $${RUN_ONCE_TIMEOUT:-1800} ))
+  while [ "$(date +%s)" -lt "$${deadline}" ]; do
+    acquire_lock "$${lock_id}" && rc=0 || rc=$?
+    case "$${rc}" in
+      0) "$@"; mark_lock_done "$${lock_id}"; return 0 ;;
+      1) [ "$(lock_state "$${lock_id}")" = "done" ] && return 0 ;;
+    esac
+    sleep 10
+  done
+  echo "==> timed out on $${lock_id}" >&2
+  return 1
+}
+
+# True once a Secrets Manager secret has any version, i.e. init already ran.
+# Second guard behind the lock, independent of DynamoDB.
+secret_has_value() {
+  local v
+  v="$(aws secretsmanager describe-secret \
+    --region "$${REGION}" \
+    --secret-id "$${1}" \
+    --query 'VersionIdsToStages' --output text 2>/dev/null || echo None)"
+  [ -n "$${v}" ] && [ "$${v}" != "None" ]
+}
+LIB
+chmod 0644 /usr/local/lib/hashistack/lock.sh

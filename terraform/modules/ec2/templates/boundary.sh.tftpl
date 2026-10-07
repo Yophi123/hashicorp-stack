@@ -1,0 +1,187 @@
+## Boundary (controller + worker on one instance)
+
+# Consul client
+
+install -d -o consul -g consul -m 0750 /opt/consul /etc/consul.d
+
+cat > /etc/consul.d/consul.hcl <<EOF
+datacenter = "${consul_datacenter}"
+data_dir   = "/opt/consul"
+log_level  = "INFO"
+node_name  = "$${INSTANCE_ID}"
+server     = false
+
+bind_addr      = "$${PRIVATE_IP}"
+advertise_addr = "$${PRIVATE_IP}"
+client_addr    = "127.0.0.1"
+
+retry_join = ["provider=aws region=$${REGION} tag_key=${join_tag_key} tag_value=${consul_join_tag}"]
+EOF
+
+chown -R consul:consul /etc/consul.d
+start_service consul
+
+# Boundary
+
+install -d -o boundary -g boundary -m 0750 /opt/boundary /etc/boundary.d
+
+SECRET_JSON="$(aws secretsmanager get-secret-value \
+  --region "$${REGION}" \
+  --secret-id "${boundary_db.secret_arn}" \
+  --query SecretString --output text)"
+
+DB_USER="$(jq -r .username <<<"$${SECRET_JSON}")"
+DB_PASS="$(jq -r .password <<<"$${SECRET_JSON}")"
+# RDS-managed passwords contain characters that break URL parsing.
+DB_PASS_ENC="$(jq -rn --arg v "$${DB_PASS}" '$v|@uri')"
+
+BOUNDARY_PG_URL="postgresql://$${DB_USER}:$${DB_PASS_ENC}@${boundary_db.host}:${boundary_db.port}/${boundary_db.dbname}?sslmode=require"
+PUBLIC_IP="$(imds public-ipv4)"
+
+cat > /etc/boundary.d/boundary.hcl <<EOF
+disable_mlock = true
+
+controller {
+  name        = "ctrl-$${INSTANCE_ID}"
+  description = "${project_name} controller"
+
+  database {
+    url = "env://BOUNDARY_PG_URL"
+  }
+
+  public_cluster_addr = "$${PRIVATE_IP}"
+}
+
+worker {
+  name        = "wrk-$${INSTANCE_ID}"
+  description = "${project_name} worker"
+
+  public_addr       = "$${PUBLIC_IP}"
+  # initial_upstreams = ["127.0.0.1:${ports.boundary.cluster}"]
+}
+
+listener "tcp" {
+  address     = "0.0.0.0:${ports.boundary.api}"
+  purpose     = "api"
+  tls_disable = true
+}
+
+listener "tcp" {
+  address     = "0.0.0.0:${ports.boundary.cluster}"
+  purpose     = "cluster"
+  tls_disable = true
+}
+
+listener "tcp" {
+  address     = "0.0.0.0:${ports.boundary.proxy}"
+  purpose     = "proxy"
+  tls_disable = true
+}
+
+listener "tcp" {
+  address     = "0.0.0.0:${ports.boundary.ops}"
+  purpose     = "ops"
+  tls_disable = true
+}
+
+kms "awskms" {
+  purpose    = "root"
+  region     = "$${REGION}"
+  kms_key_id = "${boundary_kms.boundary_root}"
+}
+
+kms "awskms" {
+  purpose    = "worker-auth"
+  region     = "$${REGION}"
+  kms_key_id = "${boundary_kms.boundary_worker_auth}"
+}
+
+kms "awskms" {
+  purpose    = "recovery"
+  region     = "$${REGION}"
+  kms_key_id = "${boundary_kms.boundary_recovery}"
+}
+EOF
+
+chown -R boundary:boundary /etc/boundary.d
+chmod 0640 /etc/boundary.d/boundary.hcl
+
+# Connection string lives in an EnvironmentFile, not an Environment= line:
+# systemd expands %-specifiers in Environment=, which mangles the %XX in a
+# URL-encoded password. Both boundary.service and the bootstrap unit read it.
+cat > /etc/boundary.d/boundary.env <<EOF
+BOUNDARY_PG_URL="$${BOUNDARY_PG_URL}"
+EOF
+chown root:boundary /etc/boundary.d/boundary.env
+chmod 0640 /etc/boundary.d/boundary.env
+
+install -d -m 0755 /etc/systemd/system/boundary.service.d
+cat > /etc/systemd/system/boundary.service.d/10-env.conf <<EOF
+[Service]
+EnvironmentFile=/etc/boundary.d/boundary.env
+EOF
+
+%{ if bootstrap_enabled ~}
+cat > /usr/local/bin/boundary-bootstrap.sh <<'SCRIPT'
+#!/usr/bin/env bash
+set -euo pipefail
+source /etc/hashistack/bootstrap.env
+source /usr/local/lib/hashistack/lock.sh
+
+INIT_SECRET="${boundary_init_secret}"
+
+# Wait for Postgres without needing a client binary on the AMI.
+for _ in $(seq 1 60); do
+  timeout 3 bash -c '</dev/tcp/${boundary_db.host}/${boundary_db.port}' 2>/dev/null && break
+  sleep 5
+done
+
+init_boundary() {
+  if secret_has_value "$${INIT_SECRET}"; then
+    echo "==> boundary database already initialized, skipping"
+    return 0
+  fi
+
+  local init_json
+  init_json="$(boundary database init \
+    -config /etc/boundary.d/boundary.hcl \
+    -format json)"
+
+  aws secretsmanager put-secret-value \
+    --region "$${REGION}" \
+    --secret-id "$${INIT_SECRET}" \
+    --secret-string "$${init_json}" >/dev/null
+  echo "==> boundary database initialized"
+}
+
+# Losers block here until the winner marks done, so no controller starts
+# against an unmigrated database.
+run_once boundary-db-init init_boundary
+SCRIPT
+chmod 0755 /usr/local/bin/boundary-bootstrap.sh
+
+cat > /etc/systemd/system/boundary-bootstrap.service <<EOF
+[Unit]
+Description=One-time Boundary database initialization
+Wants=network-online.target
+After=network-online.target
+Before=boundary.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=40min
+EnvironmentFile=/etc/boundary.d/boundary.env
+ExecStart=/usr/local/bin/boundary-bootstrap.sh
+EOF
+
+# boundary.service pulls the bootstrap in and waits for it, instead of the
+# bootstrap starting boundary from inside itself.
+cat > /etc/systemd/system/boundary.service.d/20-bootstrap.conf <<EOF
+[Unit]
+Requires=boundary-bootstrap.service
+After=boundary-bootstrap.service
+EOF
+%{ endif ~}
+
+start_service boundary --no-block

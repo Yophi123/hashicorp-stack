@@ -1,0 +1,69 @@
+#!/usr/bin/env bash
+# Shared prelude, prepended to every node group's user data.
+# Keep this role-agnostic: anything that references a service belongs in
+# that service's own template, so changing it doesn't re-version the others.
+set -euo pipefail
+exec > >(tee /var/log/user-data.log | logger -t user-data -s 2>/dev/console) 2>&1
+
+## Instance facts
+
+TOKEN=$(curl -sX PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 300")
+imds() {
+  curl -sH "X-aws-ec2-metadata-token: $${TOKEN}" \
+    "http://169.254.169.254/latest/meta-data/$${1}"
+}
+
+INSTANCE_ID="$(imds instance-id)"
+PRIVATE_IP="$(imds local-ipv4)"
+AZ="$(imds placement/availability-zone)"
+REGION="$${AZ%?}"
+
+echo "==> role=${role} instance=$${INSTANCE_ID} ip=$${PRIVATE_IP} region=$${REGION}"
+
+## Data volume (raft state / Nomad allocs)
+
+mount_data_volume() {
+  local mountpoint="$${1}"
+  local dev=""
+
+  # Nitro renames /dev/sdf, so find the unmounted, unpartitioned disk instead.
+  for candidate in /dev/nvme[0-9]n[0-9] /dev/sd[b-z] /dev/xvd[b-z]; do
+    [ -b "$${candidate}" ] || continue
+    if [ "$(lsblk -no MOUNTPOINT "$${candidate}" | tr -d '[:space:]')" = "" ] \
+      && [ "$(lsblk -no TYPE "$${candidate}")" = "disk" ]; then
+      dev="$${candidate}"
+      break
+    fi
+  done
+
+  if [ -z "$${dev}" ]; then
+    echo "==> no data volume found, using root disk for $${mountpoint}"
+    mkdir -p "$${mountpoint}"
+    return 0
+  fi
+
+  if ! blkid "$${dev}" >/dev/null 2>&1; then
+    echo "==> formatting $${dev}"
+    mkfs.ext4 -L data "$${dev}"
+  fi
+
+  mkdir -p "$${mountpoint}"
+  grep -q "LABEL=data" /etc/fstab || \
+    echo "LABEL=data $${mountpoint} ext4 defaults,nofail 0 2" >> /etc/fstab
+  mount -a
+  echo "==> mounted $${dev} at $${mountpoint}"
+}
+
+## Service start
+
+# Start a service with the config just written, whatever state the image
+# left it in: clears a failed state, then restarts so the new config is read.
+start_service() {
+  local svc="$${1}"
+  shift
+  systemctl daemon-reload
+  systemctl reset-failed "$${svc}" 2>/dev/null || true
+  systemctl enable "$${svc}"
+  systemctl restart "$@" "$${svc}"
+}

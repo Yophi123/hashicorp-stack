@@ -6,26 +6,28 @@ module "networking" {
 }
 
 # RDS
-module "rds" {
-  source                  = "./modules/rds"
-  project_name            = "hashicorp-stack"
-  database_engine         = "postgres"
-  database_engine_version = "18.3"
-  database_port           = 5432
-  db_instance_class       = "db.t3.micro"
-  vpc_id                  = module.networking.vpc-id
-  username                = "hashicorp_user"
-  subnet_ids              = module.networking.db_subnet_ids
+module "boundary_rds" {
+  source                      = "./modules/rds"
+  project_name                = "hashicorp-stack"
+  database_engine             = "postgres"
+  database_engine_version     = "18.3"
+  database_port               = 5432
+  db_instance_class           = "db.t3.micro"
+  vpc_id                      = module.networking.vpc-id
+  username                    = "hashicorp_user"
+  manage_master_user_password = false
+  subnet_ids                  = module.networking.db_subnet_ids
   # Evaluation posture: allows a clean `terraform destroy`. Flip both for production.
   skip_final_snapshot = true
   deletion_protection = false
 }
 
-# KMS Keys
+## KMS Keys
 module "kms_vault_unseal" {
   project_name = "hashicorp-stack"
   source       = "./modules/kms"
   alias        = "vault-unseal"
+  multi_region = true
 }
 
 ## KMS Key wraps everything Boundary stores in Postgres — target credentials, host catalog secrets, per-scope key hierarchies
@@ -49,17 +51,45 @@ module "kms_boundary_recovery" {
   project_name = "hashicorp-stack"
 }
 
-module "ec2" {
-  source       = "./modules/ec2"
-  project_name = "hashicorp-stack"
-  region       = var.region
+# ALB
+module "alb" {
+  source = "./modules/alb"
 
-  vpc_id             = module.networking.vpc-id
-  vpc_cidr           = module.networking.vpc-cidr_block
-  public_subnet_ids  = module.networking.web_subnet_ids
+  project_name = "hashicorp-stack"
+  vpc_id = module.networking.vpc-id
+  vpc_cidr = module.networking.vpc-cidr_block
+  public_subnet_ids = module.networking.web_subnet_ids
+
+  public_zone_name     = var.hashicorp_stack_domain
+  allowed_client_cidrs = var.allowed_client_cidrs
+
+  # Only Boundary is public. Everything else is reached through it.
+  services = {
+    boundary = {
+      hostname    = "boundary"
+      node_group  = "boundary"
+      port        = module.ec2.ports.boundary.api
+      health_port = module.ec2.ports.boundary.ops
+      health_path = "/health"
+    }
+  }
+}
+
+
+module "ec2" {
+  source = "./modules/ec2"
+  
+  project_name = "hashicorp-stack"
+  vpc_id = module.networking.vpc-id
+  vpc_cidr = module.networking.vpc-cidr_block
+
   private_subnet_ids = module.networking.app_subnet_ids
-  private_zone_id    = module.networking.zone_id
-  private_zone_name  = module.networking.zone_name
+  public_subnet_ids  = module.networking.web_subnet_ids
+
+   # Using the AWS region for both names keeps the two sites distinct for free.
+  consul_datacenter = var.region
+  nomad_region      = var.region
+
   kms_key_arns = {
     vault_unseal         = module.kms_vault_unseal.key_arn
     boundary_root        = module.kms_boundary_root.key_arn
@@ -67,19 +97,10 @@ module "ec2" {
     boundary_recovery    = module.kms_boundary_recovery.key_arn
   }
 
-  boundary_db = {
-    host       = module.rds.address
-    port       = module.rds.port
-    dbname     = module.rds.dbname
-    secret_arn = module.rds.master_user_secret_arn
-  }
+  boundary_db                   = module.boundary_rds.connection
+  boundary_db_security_group_id = module.boundary_rds.security_group_id
 
-  boundary_db_security_group_id = module.rds.security_group_id
-  allowed_client_cidrs          = var.allowed_client_cidrs
-  node_groups = {
-    nomad_consul_server = {}
-    nomad_worker        = { min_size = 2, max_size = 4, desired_capacity = 2 }
-    boundary            = { min_size = 2, max_size = 4, desired_capacity = 2 }
-    vault               = { data_volume_size = 10 }
-  }
+  target_group_arns    = module.alb.target_group_arns
+  allowed_client_cidrs = var.allowed_client_cidrs
+
 }

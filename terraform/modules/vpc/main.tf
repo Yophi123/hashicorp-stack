@@ -1,11 +1,3 @@
-data "aws_availability_zones" "available" {
-  state = "available"
-  filter {
-    name   = "opt-in-status"
-    values = ["opt-in-not-required"] # excludes Local/Wavelength Zones
-  }
-}
-
 locals {
   az_count = 3
   azs      = slice(data.aws_availability_zones.available.names, 0, 3)
@@ -25,8 +17,6 @@ locals {
     ]
   }
 }
-
-data "aws_region" "current" {}
 
 ## VPC 
 resource "aws_vpc" "main" {
@@ -69,7 +59,7 @@ resource "aws_internet_gateway" "igw" {
   }, var.tags)
 }
 
-## Egress-only Gateway(Ipv6)
+## Egress-only Gateway(IPv6)
 resource "aws_egress_only_internet_gateway" "eigw" {
   count  = var.ipv6_enabled ? 1 : 0
   vpc_id = aws_vpc.main.id
@@ -94,6 +84,8 @@ resource "aws_nat_gateway" "nat-gw" {
   vpc_id            = aws_vpc.main.id
   connectivity_type = "public"
   availability_mode = "regional"
+
+  depends_on = [aws_internet_gateway.igw]
 
   tags = merge({
     "Name"    = "${var.project_name}-natgw"

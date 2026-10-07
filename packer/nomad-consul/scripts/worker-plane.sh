@@ -16,8 +16,17 @@ apt-get install -y \
     jq \
     lsb-release \
     apt-transport-https \
-    ca-certificates
-snap install aws-cli --classic
+    ca-certificates \
+    jq \
+    unzip \
+    nvme-cli
+
+echo "==> Installing AWS CLI"    
+# AWS CLI v2, used by user data to read secrets and attach volumes.
+curl -fsSL "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o /tmp/awscliv2.zip
+unzip -q /tmp/awscliv2.zip -d /tmp
+/tmp/aws/install
+rm -rf /tmp/aws /tmp/awscliv2.zip
 
 echo "==> [2/8] Installing Hashicorp Repo..."
 install -m 0755 -d /etc/apt/keyrings

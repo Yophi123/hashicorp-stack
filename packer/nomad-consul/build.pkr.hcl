@@ -33,6 +33,7 @@ source "amazon-ebs" "nomad-consul-server" {
     Name    = "nomad-consul-server"
     Role    = "nomad-consul-control-plane"
     BuiltBy = "packer"
+    Project = "hashicorp-stack"
   }
 }
 
@@ -58,6 +59,7 @@ source "amazon-ebs" "nomad-consul-client" {
     Name    = "nomad-consul-client"
     Role    = "nomad-consul-client-plane"
     BuiltBy = "packer"
+    Project = "hashicorp-stack"
   }
 }
 

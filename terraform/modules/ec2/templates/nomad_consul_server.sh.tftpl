@@ -1,0 +1,78 @@
+## Nomad + Consul control plane
+
+# Consul server
+
+install -d -o consul -g consul -m 0750 /opt/consul /etc/consul.d
+
+cat > /etc/consul.d/consul.hcl <<EOF
+datacenter         = "${consul_datacenter}"
+primary_datacenter = "${primary_datacenter}"
+data_dir           = "/opt/consul"
+log_level          = "INFO"
+node_name          = "$${INSTANCE_ID}"
+server             = true
+bootstrap_expect   = ${bootstrap_expect}
+
+bind_addr      = "$${PRIVATE_IP}"
+advertise_addr = "$${PRIVATE_IP}"
+client_addr    = "0.0.0.0"
+
+retry_join     = ["provider=aws region=$${REGION} tag_key=${join_tag_key} tag_value=${consul_join_tag}"]
+retry_join_wan = ${jsonencode(wan_join)}
+
+ui_config {
+  enabled = true
+}
+
+ports {
+  http = ${ports.consul.http}
+  dns  = ${ports.consul.dns}
+}
+
+# Bootstrap posture: no gossip encryption, no mTLS, no ACLs. All three are
+# added once Vault is up and can issue the material.
+EOF
+
+chown -R consul:consul /etc/consul.d
+start_service consul
+
+# Nomad server
+
+install -d -o nomad -g nomad -m 0750 /opt/nomad /etc/nomad.d
+
+cat > /etc/nomad.d/nomad.hcl <<EOF
+region     = "${nomad_region}"
+datacenter = "${consul_datacenter}"
+data_dir   = "/opt/nomad"
+name       = "$${INSTANCE_ID}"
+
+bind_addr = "0.0.0.0"
+
+advertise {
+  http = "$${PRIVATE_IP}:${ports.nomad.http}"
+  rpc  = "$${PRIVATE_IP}:${ports.nomad.rpc}"
+  serf = "$${PRIVATE_IP}:${ports.nomad.serf}"
+}
+
+server {
+  enabled              = true
+  bootstrap_expect     = ${bootstrap_expect}
+  authoritative_region = "${authoritative_region}"
+%{ if length(wan_join) > 0 ~}
+
+  # Joining a server in the other region is what federates the two.
+  server_join {
+    retry_join = ${jsonencode(wan_join)}
+  }
+%{ endif ~}
+}
+
+consul {
+  address          = "127.0.0.1:${ports.consul.http}"
+  server_auto_join = true
+  client_auto_join = true
+}
+EOF
+
+chown -R nomad:nomad /etc/nomad.d
+start_service nomad

@@ -34,6 +34,7 @@ source "amazon-ebs" "vault" {
     Name    = "vault-server"
     Role    = "vault-control-plane"
     BuiltBy = "packer"
+    Project = "hashicorp-stack"
   }
 }
 
