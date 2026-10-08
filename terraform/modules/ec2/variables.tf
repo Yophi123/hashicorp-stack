@@ -300,3 +300,17 @@ variable "enable_bootstrap_automation" {
   description = "Run vault operator init and boundary database init automatically on first boot, with a DynamoDB lock electing the one node that does it. Off means you init both by hand over SSM."
   default     = true
 }
+
+## Vault snapshots
+variable "vault_snapshots" {
+  type = object({
+    bucket_name      = string
+    bucket_arn       = string
+    interval_minutes = optional(number, 10)
+  })
+  description = <<-EOT
+    S3 bucket for Vault Raft snapshots. When set, the active Vault node saves a
+    snapshot on a timer, and a new node with no data restores the latest one
+    instead of initializing. Requires enable_bootstrap_automation.
+  EOT
+}

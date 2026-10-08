@@ -55,9 +55,9 @@ module "kms_boundary_recovery" {
 module "alb" {
   source = "./modules/alb"
 
-  project_name = "hashicorp-stack"
-  vpc_id = module.networking.vpc-id
-  vpc_cidr = module.networking.vpc-cidr_block
+  project_name      = "hashicorp-stack"
+  vpc_id            = module.networking.vpc-id
+  vpc_cidr          = module.networking.vpc-cidr_block
   public_subnet_ids = module.networking.web_subnet_ids
 
   public_zone_name     = var.hashicorp_stack_domain
@@ -75,18 +75,28 @@ module "alb" {
   }
 }
 
+module "snapshots" {
+  source = "./modules/s3"
+
+  project_name      = "hashicorp-stack"
+  name              = "snapshots"
+  expiring_prefixes = { "vault/history/" = 7 }
+
+  # Evaluation posture: allows a clean terraform destroy.
+  force_destroy = true
+}
 
 module "ec2" {
   source = "./modules/ec2"
-  
+
   project_name = "hashicorp-stack"
-  vpc_id = module.networking.vpc-id
-  vpc_cidr = module.networking.vpc-cidr_block
+  vpc_id       = module.networking.vpc-id
+  vpc_cidr     = module.networking.vpc-cidr_block
 
   private_subnet_ids = module.networking.app_subnet_ids
   public_subnet_ids  = module.networking.web_subnet_ids
 
-   # Using the AWS region for both names keeps the two sites distinct for free.
+  # Using the AWS region for both names keeps the two sites distinct for free.
   consul_datacenter = var.region
   nomad_region      = var.region
 
@@ -103,4 +113,8 @@ module "ec2" {
   target_group_arns    = module.alb.target_group_arns
   allowed_client_cidrs = var.allowed_client_cidrs
 
+  vault_snapshots = {
+    bucket_name = module.snapshots.bucket_name
+    bucket_arn  = module.snapshots.bucket_arn
+  }
 }

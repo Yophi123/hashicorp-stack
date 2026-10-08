@@ -6,6 +6,9 @@ locals {
   has_vault    = contains(local.groups, "vault")
   has_boundary = contains(local.groups, "boundary")
 
+    # Matches the Vault instance role at either site, and survives the role being recreated.
+  vault_role_pattern = "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:role/${var.project_name}-vault-*"
+
   tags = merge(var.tags, { Project = var.project_name })
 
   # Ports are facts about the products, not about this deployment.
@@ -171,6 +174,9 @@ locals {
       vault_node_count  = try(var.node_groups["vault"].desired_capacity, 1)
       bootstrap_enabled = var.enable_bootstrap_automation
       vault_init_secret = try(aws_secretsmanager_secret.vault_init[0].arn, "")
+      snapshot_bucket       = try(var.vault_snapshots.bucket_name, "")
+      snapshot_interval     = try(var.vault_snapshots.interval_minutes, 10)
+      snapshot_role_pattern = local.vault_role_pattern
     }
 
     boundary = {
@@ -355,6 +361,14 @@ resource "aws_iam_role_policy_attachment" "ssm" {
 
   role       = aws_iam_role.node[each.key].name
   policy_arn = "arn:${data.aws_partition.current.partition}:iam::aws:policy/AmazonSSMManagedInstanceCore"
+}
+
+resource "aws_iam_role_policy" "vault_snapshots" {
+  count = local.has_vault && var.vault_snapshots != null ? 1 : 0
+
+  name_prefix = "vault-snapshots-"
+  role        = aws_iam_role.node["vault"].id
+  policy      = data.aws_iam_policy_document.vault_snapshots[0].json
 }
 
 ## Bootstrap automation

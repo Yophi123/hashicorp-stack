@@ -4,6 +4,13 @@ variable "region" {
   default     = "ap-southeast-1"
 }
 
+variable "pilot_light_region" {
+  type        = string
+  description = "AWS region for the whole stack."
+  default     = "eu-west-1"
+}
+
+
 variable "allowed_client_cidrs" {
   type        = list(string)
   description = <<-EOT

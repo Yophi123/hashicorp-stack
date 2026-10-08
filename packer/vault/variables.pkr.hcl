@@ -5,7 +5,7 @@ variable "region" {
 
 variable "ami_regions" {
   type    = list(string)
-  default = ["eu-west-1", "eu-west-2"]
+  default = ["eu-west-1"]
 }
 
 variable "instance_type" {

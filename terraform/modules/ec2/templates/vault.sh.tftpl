@@ -22,6 +22,7 @@ chown -R consul:consul /etc/consul.d
 start_service consul
 
 # Vault
+
 systemctl stop vault 2>/dev/null || true
 mount_data_volume /opt/vault
 install -d -o vault -g vault -m 0750 /opt/vault/data /etc/vault.d
@@ -67,8 +68,67 @@ chown -R vault:vault /etc/vault.d
 start_service vault
 
 %{ if bootstrap_enabled ~}
-# One-time init. Terraform interpolates into the quoted heredoc below; bash
-# does not, so everything written as $${...} expands when the script runs.
+%{ if snapshot_bucket != "" ~}
+# Snapshots. Terraform interpolates into the quoted heredocs below; bash does
+# not, so everything written as $${...} expands when the script runs.
+cat > /usr/local/bin/vault-snapshot.sh <<'SNAP'
+#!/usr/bin/env bash
+# Saves a raft snapshot to S3. The timer runs on every Vault node; only the
+# active one does the work.
+set -euo pipefail
+source /etc/hashistack/bootstrap.env
+
+export VAULT_ADDR="http://127.0.0.1:${ports.vault.api}"
+BUCKET="${snapshot_bucket}"
+
+curl -fsS "$${VAULT_ADDR}/v1/sys/leader" 2>/dev/null | jq -e '.is_self == true' >/dev/null || exit 0
+# Never snapshot the throwaway Vault that exists in the middle of a restore.
+[ ! -f /opt/vault/.restore-pending ] || exit 0
+
+# The node proves who it is with its IAM role; no token is stored anywhere.
+VAULT_TOKEN="$(vault login -method=aws -token-only role=snapshot)"
+export VAULT_TOKEN
+
+tmp="$(mktemp -d)"
+trap 'rm -rf "$${tmp}"' EXIT
+
+vault operator raft snapshot save "$${tmp}/vault.snap"
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+aws s3 cp --only-show-errors --region "$${REGION}" "$${tmp}/vault.snap" "s3://$${BUCKET}/vault/history/$${stamp}.snap"
+aws s3 cp --only-show-errors --region "$${REGION}" "$${tmp}/vault.snap" "s3://$${BUCKET}/vault/latest.snap"
+echo "==> snapshot $${stamp} saved"
+SNAP
+chmod 0755 /usr/local/bin/vault-snapshot.sh
+
+cat > /etc/systemd/system/vault-snapshot.service <<EOF
+[Unit]
+Description=Vault raft snapshot to S3
+After=vault.service
+
+[Service]
+Type=oneshot
+Environment=HOME=/root
+ExecStart=/usr/local/bin/vault-snapshot.sh
+EOF
+
+cat > /etc/systemd/system/vault-snapshot.timer <<EOF
+[Unit]
+Description=Vault raft snapshot every ${snapshot_interval} minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=${snapshot_interval}min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now vault-snapshot.timer
+
+%{ endif ~}
+# One-time init, or restore from the latest snapshot when one exists.
 cat > /usr/local/bin/vault-bootstrap.sh <<'SCRIPT'
 #!/usr/bin/env bash
 set -euo pipefail
@@ -77,6 +137,9 @@ source /usr/local/lib/hashistack/lock.sh
 
 export VAULT_ADDR="http://127.0.0.1:${ports.vault.api}"
 INIT_SECRET="${vault_init_secret}"
+SNAPSHOT_BUCKET="${snapshot_bucket}"
+SNAPSHOT_KEY="vault/latest.snap"
+RESTORE_MARKER="/opt/vault/.restore-pending"
 
 vault_initialized() {
   local out
@@ -84,13 +147,74 @@ vault_initialized() {
   grep -q '"initialized": true' <<<"$${out}"
 }
 
+# Initialized with real data, as opposed to the throwaway init of an
+# unfinished restore.
+vault_has_data() {
+  vault_initialized && [ ! -f "$${RESTORE_MARKER}" ]
+}
+
+vault_active() {
+  curl -fsS "$${VAULT_ADDR}/v1/sys/leader" 2>/dev/null | jq -e '.is_self == true' >/dev/null
+}
+
 # vault status exit codes: 0 unsealed, 2 sealed (but listening), 1 unreachable.
-for _ in $(seq 1 60); do
-  rc=0
-  vault status >/dev/null 2>&1 || rc=$?
-  [ "$${rc}" -ne 1 ] && break
-  sleep 5
-done
+wait_listening() {
+  local rc
+  for _ in $(seq 1 60); do
+    rc=0
+    vault status >/dev/null 2>&1 || rc=$?
+    [ "$${rc}" -ne 1 ] && return 0
+    sleep 5
+  done
+  echo "==> vault is not listening" >&2
+  return 1
+}
+
+wait_active() {
+  for _ in $(seq 1 60); do
+    vault_active && return 0
+    sleep 5
+  done
+  echo "==> vault did not become active" >&2
+  return 1
+}
+
+snapshot_exists() {
+  local err
+  for _ in 1 2 3; do
+    if err="$(aws s3api head-object \
+        --region "$${REGION}" \
+        --bucket "$${SNAPSHOT_BUCKET}" \
+        --key "$${SNAPSHOT_KEY}" 2>&1 >/dev/null)"; then
+      return 0
+    fi
+    if grep -Eq '\(404\)|Not Found' <<<"$${err}"; then
+      return 1
+    fi
+    sleep 5
+  done
+  # Guessing here could initialize a second, empty Vault. Stop instead.
+  echo "==> cannot tell whether a snapshot exists: $${err}" >&2
+  exit 1
+}
+
+# Lets the node's own IAM role log in and read snapshots, nothing else.
+# Safe to re-run. Needs VAULT_TOKEN.
+configure_snapshot_auth() {
+  { vault auth list -format=json | jq -e '."aws/"' >/dev/null || vault auth enable aws; } \
+    && vault policy write snapshot - <<'POLICY' \
+    && vault write auth/aws/role/snapshot \
+         auth_type=iam \
+         bound_iam_principal_arn="${snapshot_role_pattern}" \
+         resolve_aws_unique_ids=false \
+         token_policies=snapshot \
+         token_ttl=10m \
+         token_max_ttl=10m
+path "sys/storage/raft/snapshot" {
+  capabilities = ["read"]
+}
+POLICY
+}
 
 init_vault() {
   # Re-check under the lock. A node that already joined, or a cluster whose
@@ -100,7 +224,7 @@ init_vault() {
     return 0
   fi
 
-  local init_json
+  local init_json ok=0
   # Auto-unseal means these are recovery keys, not unseal keys.
   init_json="$(vault operator init \
     -recovery-shares=5 \
@@ -113,45 +237,133 @@ init_vault() {
     --secret-string "$${init_json}" >/dev/null
   echo "==> vault initialized, credentials written to Secrets Manager"
 
-%{ if vault_node_count >= 3 ~}
-  # Dead-server cleanup needs min-quorum >= 3, so it is skipped on smaller
-  # clusters. Autopilot is runtime config set through the API.
   VAULT_TOKEN="$(jq -r .root_token <<<"$${init_json}")"
   export VAULT_TOKEN
-  for _ in $(seq 1 30); do
-    if vault operator raft autopilot set-config \
-        -cleanup-dead-servers=true \
-        -dead-server-last-contact-threshold=10m \
-        -min-quorum=${vault_node_count} >/dev/null 2>&1; then
-      echo "==> autopilot configured"
+  wait_active || true
+
+%{ if snapshot_bucket != "" ~}
+  for _ in $(seq 1 12); do
+    if configure_snapshot_auth >/dev/null 2>&1; then
+      ok=1
       break
     fi
     sleep 5
   done
+  if [ "$${ok}" -eq 1 ]; then
+    echo "==> snapshot auth configured"
+  else
+    echo "==> WARNING: snapshot auth not configured; snapshots will fail" >&2
+  fi
+
+%{ endif ~}
+%{ if vault_node_count >= 3 ~}
+  # Dead-server cleanup needs min-quorum >= 3, so it is skipped on smaller clusters.
+  vault operator raft autopilot set-config \
+    -cleanup-dead-servers=true \
+    -dead-server-last-contact-threshold=10m \
+    -min-quorum=${vault_node_count} >/dev/null 2>&1 \
+    && echo "==> autopilot configured" \
+    || echo "==> WARNING: autopilot not configured" >&2
+
+%{ endif ~}
   unset VAULT_TOKEN
+%{ if snapshot_bucket != "" ~}
+
+  # Take the first snapshot now, so an initialized cluster never exists without one.
+  /usr/local/bin/vault-snapshot.sh || echo "==> WARNING: first snapshot failed" >&2
 %{ endif ~}
 }
 
-if vault_initialized; then
+restore_vault() {
+  local tmp init_json
+
+  if [ -f "$${RESTORE_MARKER}" ]; then
+    echo "==> an earlier restore did not finish; clearing its throwaway data"
+    systemctl stop vault
+    find /opt/vault/data -mindepth 1 -delete
+    systemctl start vault
+    wait_listening
+  fi
+
+  tmp="$(mktemp -d)"
+  aws s3 cp --only-show-errors --region "$${REGION}" \
+    "s3://$${SNAPSHOT_BUCKET}/$${SNAPSHOT_KEY}" "$${tmp}/vault.snap"
+
+  # A snapshot can only be restored into a running, unsealed Vault, so
+  # initialize a throwaway one. Its keys and token are discarded: after the
+  # restore, the original root token and recovery keys apply again.
+  touch "$${RESTORE_MARKER}"
+  init_json="$(vault operator init -recovery-shares=1 -recovery-threshold=1 -format=json)"
+  VAULT_TOKEN="$(jq -r .root_token <<<"$${init_json}")"
+  export VAULT_TOKEN
+  wait_active
+
+  vault operator raft snapshot restore -force "$${tmp}/vault.snap"
+  unset VAULT_TOKEN
+  rm -rf "$${tmp}"
+
+  wait_active
+  rm -f "$${RESTORE_MARKER}"
+  echo "==> vault restored from s3://$${SNAPSHOT_BUCKET}/$${SNAPSHOT_KEY}"
+}
+
+restore_when_alone() {
+  local deadline rc
+%{ if vault_node_count > 1 ~}
+  # Give retry_join a minute first. A node joining a live cluster gets its
+  # data from the leader and must not restore over it.
+  for _ in $(seq 1 12); do
+    if vault_has_data; then
+      return 0
+    fi
+    sleep 5
+  done
+%{ endif ~}
+  deadline=$(( $(date +%s) + 1800 ))
+  while [ "$(date +%s)" -lt "$${deadline}" ]; do
+    if vault_has_data; then
+      return 0
+    fi
+    acquire_lock vault-restore && rc=0 || rc=$?
+    if [ "$${rc}" -eq 0 ]; then
+      restore_vault
+      release_lock
+      return 0
+    fi
+    sleep 10
+  done
+  echo "==> timed out waiting to restore" >&2
+  return 1
+}
+
+wait_listening
+
+if vault_has_data; then
   echo "==> already initialized, nothing to do"
   exit 0
 fi
 
-run_once vault-init init_vault
+if [ -n "$${SNAPSHOT_BUCKET}" ] && snapshot_exists; then
+  restore_when_alone
+else
+  run_once vault-init init_vault
+fi
 SCRIPT
 chmod 0755 /usr/local/bin/vault-bootstrap.sh
 
+# Wants, not Requires: the restore path stops and starts Vault, and Requires
+# would stop this unit along with it.
 cat > /etc/systemd/system/vault-bootstrap.service <<EOF
 [Unit]
-Description=One-time Vault initialization
-Wants=network-online.target
+Description=One-time Vault initialization or restore
+Wants=vault.service network-online.target
 After=vault.service network-online.target
-Requires=vault.service
 
 [Service]
 Type=oneshot
 RemainAfterExit=yes
 TimeoutStartSec=40min
+Environment=HOME=/root
 ExecStart=/usr/local/bin/vault-bootstrap.sh
 
 [Install]
@@ -160,7 +372,6 @@ EOF
 
 systemctl daemon-reload
 systemctl enable vault-bootstrap.service
-systemctl restart vault
 # --no-block: nodes that lose the election wait up to 30 min in run_once,
 # and that should not hold cloud-init hostage.
 systemctl start --no-block vault-bootstrap.service

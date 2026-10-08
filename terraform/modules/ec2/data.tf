@@ -2,6 +2,8 @@ data "aws_region" "current" {}
 
 data "aws_partition" "current" {}
 
+data "aws_caller_identity" "current" {}
+
 data "aws_ami" "node" {
   region      = data.aws_region.current.region
   for_each    = var.node_groups
@@ -35,7 +37,6 @@ data "aws_ami" "node" {
 }
 
 ## IAM: shared by every node group
-
 data "aws_iam_policy_document" "assume" {
   statement {
     effect  = "Allow"
@@ -106,7 +107,6 @@ data "aws_iam_policy_document" "vault_bootstrap" {
 }
 
 ## IAM: Boundary
-
 data "aws_iam_policy_document" "boundary" {
   count = contains(keys(var.node_groups), "boundary") ? 1 : 0
 
@@ -179,5 +179,32 @@ data "aws_iam_policy_document" "boundary_bootstrap" {
     effect    = "Allow"
     actions   = ["kms:GenerateDataKey"]
     resources = [var.kms_key_arns.boundary_root]
+  }
+}
+
+data "aws_iam_policy_document" "vault_snapshots" {
+  count = contains(keys(var.node_groups), "vault") && var.vault_snapshots != null ? 1 : 0
+
+  statement {
+    sid       = "SnapshotObjects"
+    effect    = "Allow"
+    actions   = ["s3:GetObject", "s3:PutObject"]
+    resources = ["${var.vault_snapshots.bucket_arn}/vault/*"]
+  }
+
+  # Without ListBucket, a missing snapshot reads as "access denied" instead of "not found".
+  statement {
+    sid       = "SnapshotList"
+    effect    = "Allow"
+    actions   = ["s3:ListBucket"]
+    resources = [var.vault_snapshots.bucket_arn]
+  }
+
+  # Vault's AWS auth looks up the caller's role to match it against the snapshot binding.
+  statement {
+    sid       = "ResolveOwnRole"
+    effect    = "Allow"
+    actions   = ["iam:GetRole"]
+    resources = [local.vault_role_pattern]
   }
 }

@@ -15,6 +15,10 @@ chmod 0644 /etc/hashistack/bootstrap.env
 cat > /usr/local/lib/hashistack/lock.sh <<'LIB'
 # Sourced, not executed. Expects REGION, INSTANCE_ID and LOCK_TABLE.
 
+# The lock this process holds, if any. It is released on exit, so a run that
+# fails does not block the next attempt for the length of the lease.
+HELD_LOCK=""
+
 # Single-winner election via a DynamoDB conditional put.
 # Returns 0 = acquired, 1 = held by someone else (or already done), 2 = real error.
 acquire_lock() {
@@ -28,12 +32,30 @@ acquire_lock() {
       --expression-attribute-names '{"#s":"state"}' \
       --expression-attribute-values "{\":ip\":{\"S\":\"in-progress\"},\":now\":{\"N\":\"$${now}\"}}" \
       2>&1 >/dev/null)"; then
+    HELD_LOCK="$${lock_id}"
     return 0
   fi
   grep -q ConditionalCheckFailedException <<<"$${err}" && return 1
   echo "==> lock error: $${err}" >&2
   return 2
 }
+
+# Gives the held lock back by expiring its lease. The item stays, and the next
+# caller takes it over through the normal expired-lease path.
+release_lock() {
+  [ -n "$${HELD_LOCK}" ] || return 0
+  aws dynamodb update-item \
+    --region "$${REGION}" \
+    --table-name "$${LOCK_TABLE}" \
+    --key "{\"LockId\":{\"S\":\"$${HELD_LOCK}\"}}" \
+    --update-expression "SET expires_at = :zero" \
+    --condition-expression "holder = :me AND #s = :ip" \
+    --expression-attribute-names '{"#s":"state"}' \
+    --expression-attribute-values "{\":zero\":{\"N\":\"0\"},\":me\":{\"S\":\"$${INSTANCE_ID}\"},\":ip\":{\"S\":\"in-progress\"}}" \
+    >/dev/null 2>&1 || true
+  HELD_LOCK=""
+}
+trap release_lock EXIT
 
 # The "done" record is permanent on purpose: it is the marker that stops a
 # replacement node, months later, from initializing a second time.
@@ -47,6 +69,7 @@ mark_lock_done() {
     --expression-attribute-names '{"#s":"state"}' \
     --expression-attribute-values "{\":d\":{\"S\":\"done\"},\":me\":{\"S\":\"$${INSTANCE_ID}\"}}" \
     >/dev/null
+  HELD_LOCK=""
 }
 
 lock_state() {
@@ -60,7 +83,7 @@ lock_state() {
 
 # run_once <lock_id> <command...>
 # Every node calls this. One runs the command; the rest wait for "done",
-# and take over automatically if the holder's lease expires.
+# and take over automatically if the holder fails or its lease expires.
 run_once() {
   local lock_id="$${1}" rc deadline
   shift
