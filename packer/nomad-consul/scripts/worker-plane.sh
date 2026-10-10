@@ -64,6 +64,62 @@ echo "net.bridge.bridge-nf-call-arptables = 1" | tee -a /etc/sysctl.d/bridge.con
 echo "net.bridge.bridge-nf-call-iptables = 1"  | tee -a /etc/sysctl.d/bridge.conf > /dev/null
 echo "net.bridge.bridge-nf-call-ip6tables = 1" | tee -a /etc/sysctl.d/bridge.conf > /dev/null
 
+echo "==> Configuring Consul DNS and SSH certificate trust..."
+
+# Send *.consul lookups to the local Consul agent; everything else is untouched.
+install -d -m 0755 /etc/systemd/resolved.conf.d
+cat > /etc/systemd/resolved.conf.d/consul.conf <<'EOF'
+[Resolve]
+DNS=127.0.0.1:8600
+DNSSEC=false
+Domains=~consul
+EOF
+
+# Trust certificates signed by Vault's SSH CA. The file starts empty and is
+# filled by the timer below once Vault is up.
+touch /etc/ssh/trusted-user-ca-keys.pem
+chmod 0644 /etc/ssh/trusted-user-ca-keys.pem
+cat > /etc/ssh/sshd_config.d/10-vault-ca.conf <<'EOF'
+TrustedUserCAKeys /etc/ssh/trusted-user-ca-keys.pem
+PasswordAuthentication no
+EOF
+
+cat > /usr/local/bin/fetch-ssh-ca.sh <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+tmp="$(mktemp)"
+trap 'rm -f "${tmp}"' EXIT
+curl -fsS --max-time 5 http://vault.service.consul:8200/v1/ssh/public_key -o "${tmp}"
+grep -q '^ssh-' "${tmp}"
+install -m 0644 "${tmp}" /etc/ssh/trusted-user-ca-keys.pem
+EOF
+chmod 0755 /usr/local/bin/fetch-ssh-ca.sh
+
+cat > /etc/systemd/system/fetch-ssh-ca.service <<'EOF'
+[Unit]
+Description=Fetch the Vault SSH CA public key
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/fetch-ssh-ca.sh
+EOF
+
+cat > /etc/systemd/system/fetch-ssh-ca.timer <<'EOF'
+[Unit]
+Description=Refresh the Vault SSH CA public key
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=5min
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl enable fetch-ssh-ca.timer
+
 echo "==> [6/8] Creating directory structure and system users..."
 # Consul setup
 id -u consul &>/dev/null || useradd --system --home /etc/consul.d --shell /bin/false consul

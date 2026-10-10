@@ -17,7 +17,6 @@ variable "tags" {
 }
 
 ## Network
-
 variable "vpc_id" {
   type        = string
   description = "VPC the instances launch into."
@@ -72,9 +71,9 @@ variable "ami_role_tags" {
 
 variable "node_groups" {
   type = map(object({
-    instance_type    = optional(string, "t3.medium")
+    instance_type    = optional(string, "t3.small")
     min_size         = optional(number, 1)
-    max_size         = optional(number, 1)
+    max_size         = optional(number, 3)
     desired_capacity = optional(number, 1)
 
     # Launch in public_subnet_ids with a public IP. Only the Boundary worker needs this.
@@ -230,7 +229,6 @@ variable "kms_key_arns" {
 }
 
 ## Boundary database
-
 variable "boundary_db" {
   type = object({
     host       = string
@@ -307,10 +305,28 @@ variable "vault_snapshots" {
     bucket_name      = string
     bucket_arn       = string
     interval_minutes = optional(number, 10)
+
+    copy_to = optional(list(object({
+      bucket_name = string
+      bucket_arn  = string
+      region      = string
+    })), [])
   })
   description = <<-EOT
     S3 bucket for Vault Raft snapshots. When set, the active Vault node saves a
     snapshot on a timer, and a new node with no data restores the latest one
-    instead of initializing. Requires enable_bootstrap_automation.
+    instead of initializing. copy_to lists buckets in other regions that get a
+    second copy of every snapshot. Requires enable_bootstrap_automation.
   EOT
+  default     = null
+}
+
+## Secrets
+variable "init_secret_arns" {
+  type = object({
+    vault    = optional(string)
+    boundary = optional(string)
+  })
+  description = "Secrets Manager secrets that receive the first-boot init output. Each is required when enable_bootstrap_automation is on and its node group exists."
+  default     = {}
 }

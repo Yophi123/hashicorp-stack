@@ -6,7 +6,7 @@ locals {
   has_vault    = contains(local.groups, "vault")
   has_boundary = contains(local.groups, "boundary")
 
-    # Matches the Vault instance role at either site, and survives the role being recreated.
+  # Matches the Vault instance role at either site, and survives the role being recreated.
   vault_role_pattern = "arn:${data.aws_partition.current.partition}:iam::${data.aws_caller_identity.current.account_id}:role/${var.project_name}-vault-*"
 
   tags = merge(var.tags, { Project = var.project_name })
@@ -173,22 +173,25 @@ locals {
       vault_kms_key_id  = var.kms_key_arns.vault_unseal
       vault_node_count  = try(var.node_groups["vault"].desired_capacity, 1)
       bootstrap_enabled = var.enable_bootstrap_automation
-      vault_init_secret = try(aws_secretsmanager_secret.vault_init[0].arn, "")
+      # vault_init_secret     = try(aws_secretsmanager_secret.vault_init[0].arn, "")
+      vault_init_secret     = var.init_secret_arns.vault == null ? "" : var.init_secret_arns.vault
       snapshot_bucket       = try(var.vault_snapshots.bucket_name, "")
       snapshot_interval     = try(var.vault_snapshots.interval_minutes, 10)
       snapshot_role_pattern = local.vault_role_pattern
+      snapshot_copies       = try(var.vault_snapshots.copy_to, [])
     }
 
     boundary = {
-      project_name         = var.project_name
-      consul_datacenter    = var.consul_datacenter
-      ports                = local.ports
-      join_tag_key         = var.retry_join_tag_key
-      consul_join_tag      = local.consul_join_tag
-      boundary_kms         = var.kms_key_arns
-      boundary_db          = var.boundary_db
-      bootstrap_enabled    = var.enable_bootstrap_automation
-      boundary_init_secret = try(aws_secretsmanager_secret.boundary_init[0].arn, "")
+      project_name      = var.project_name
+      consul_datacenter = var.consul_datacenter
+      ports             = local.ports
+      join_tag_key      = var.retry_join_tag_key
+      consul_join_tag   = local.consul_join_tag
+      boundary_kms      = var.kms_key_arns
+      boundary_db       = var.boundary_db
+      bootstrap_enabled = var.enable_bootstrap_automation
+      # boundary_init_secret = try(aws_secretsmanager_secret.boundary_init[0].arn, "")
+      boundary_init_secret = var.init_secret_arns.boundary == null ? "" : var.init_secret_arns.boundary
     }
   }
 }
@@ -387,27 +390,28 @@ resource "aws_dynamodb_table" "bootstrap_lock" {
   tags = local.tags
 }
 
-resource "aws_secretsmanager_secret" "vault_init" {
-  count = var.enable_bootstrap_automation && local.has_vault ? 1 : 0
+## Secrets
+# resource "aws_secretsmanager_secret" "vault_init" {
+#   count = var.enable_bootstrap_automation && local.has_vault ? 1 : 0
 
-  name_prefix             = "${var.project_name}/vault/init-"
-  description             = "Vault recovery keys and initial root token"
-  kms_key_id              = var.kms_key_arns.vault_unseal
-  recovery_window_in_days = 7
+#   name_prefix             = "${var.project_name}/vault/init-"
+#   description             = "Vault recovery keys and initial root token"
+#   kms_key_id              = var.kms_key_arns.vault_unseal
+#   recovery_window_in_days = 7
 
-  tags = local.tags
-}
+#   tags = local.tags
+# }
 
-resource "aws_secretsmanager_secret" "boundary_init" {
-  count = var.enable_bootstrap_automation && local.has_boundary ? 1 : 0
+# resource "aws_secretsmanager_secret" "boundary_init" {
+#   count = var.enable_bootstrap_automation && local.has_boundary ? 1 : 0
 
-  name_prefix             = "${var.project_name}/boundary/init-"
-  description             = "Boundary initial admin credentials and auth method ID"
-  kms_key_id              = var.kms_key_arns.boundary_root
-  recovery_window_in_days = 7
+#   name_prefix             = "${var.project_name}/boundary/init-"
+#   description             = "Boundary initial admin credentials and auth method ID"
+#   kms_key_id              = var.kms_key_arns.boundary_root
+#   recovery_window_in_days = 7
 
-  tags = local.tags
-}
+#   tags = local.tags
+# }
 
 ## Launch templates
 resource "aws_launch_template" "node" {
@@ -470,7 +474,7 @@ resource "aws_launch_template" "node" {
 
   # Assembled per role: shared prelude, the lock library (vault and boundary
   # only), the role's own script, then any extra_user_data for the group.
-  user_data = base64encode(join("\n", compact([
+  user_data = base64gzip(join("\n", compact([
     templatefile("${path.module}/templates/common.sh.tftpl", { role = each.key }),
     contains(local.bootstrap_roles, each.key) ? templatefile("${path.module}/templates/bootstrap_lock.sh.tftpl", { lock_table = local.lock_table }) : "",
     templatefile("${path.module}/templates/${each.key}.sh.tftpl", local.user_data_vars[each.key]),

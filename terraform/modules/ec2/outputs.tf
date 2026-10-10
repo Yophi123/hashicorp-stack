@@ -35,13 +35,3 @@ output "ports" {
   description = "Port numbers for every product. The alb module reads these for its target groups and health checks."
   value       = local.ports
 }
-
-output "vault_init_secret_arn" {
-  description = "Secrets Manager ARN holding Vault's recovery keys and initial root token. Null when bootstrap automation is off or there is no vault group."
-  value       = try(aws_secretsmanager_secret.vault_init[0].arn, null)
-}
-
-output "boundary_init_secret_arn" {
-  description = "Secrets Manager ARN holding Boundary's initial admin credentials. Null when bootstrap automation is off or there is no boundary group."
-  value       = try(aws_secretsmanager_secret.boundary_init[0].arn, null)
-}

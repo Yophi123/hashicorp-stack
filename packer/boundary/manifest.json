@@ -1,0 +1,14 @@
+{
+  "builds": [
+    {
+      "name": "boundary",
+      "builder_type": "amazon-ebs",
+      "build_time": 1791548301,
+      "files": null,
+      "artifact_id": "ap-southeast-1:ami-0a7be24d4c4f7efde,eu-west-1:ami-0414852978d049fcb",
+      "packer_run_uuid": "594a2764-b437-c5bb-e459-ba901f53125f",
+      "custom_data": null
+    }
+  ],
+  "last_run_uuid": "594a2764-b437-c5bb-e459-ba901f53125f"
+}

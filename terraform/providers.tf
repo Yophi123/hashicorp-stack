@@ -19,3 +19,9 @@ provider "aws" {
   region  = var.region
   profile = "terraform"
 }
+
+provider "aws" {
+  alias   = "pilot_light"
+  region  = var.pilot_light_region
+  profile = "terraform"
+}

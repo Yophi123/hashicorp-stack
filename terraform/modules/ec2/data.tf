@@ -94,7 +94,7 @@ data "aws_iam_policy_document" "vault_bootstrap" {
     sid       = "StoreInitOutput"
     effect    = "Allow"
     actions   = ["secretsmanager:PutSecretValue", "secretsmanager:DescribeSecret"]
-    resources = [aws_secretsmanager_secret.vault_init[0].arn]
+    resources = [var.init_secret_arns.vault]
   }
 
   # The init secret is encrypted with the unseal key; writing it needs a data key.
@@ -103,6 +103,13 @@ data "aws_iam_policy_document" "vault_bootstrap" {
     effect    = "Allow"
     actions   = ["kms:GenerateDataKey"]
     resources = [var.kms_key_arns.vault_unseal]
+  }
+
+  lifecycle {
+    precondition {
+      condition     = var.init_secret_arns.vault != null
+      error_message = "init_secret_arns.vault is required when bootstrap automation is on and the vault node group exists."
+    }
   }
 }
 
@@ -170,7 +177,7 @@ data "aws_iam_policy_document" "boundary_bootstrap" {
     sid       = "StoreInitOutput"
     effect    = "Allow"
     actions   = ["secretsmanager:PutSecretValue", "secretsmanager:DescribeSecret"]
-    resources = [aws_secretsmanager_secret.boundary_init[0].arn]
+    resources = [var.init_secret_arns.boundary]
   }
 
   # The init secret is encrypted with the Boundary root key.
@@ -206,5 +213,16 @@ data "aws_iam_policy_document" "vault_snapshots" {
     effect    = "Allow"
     actions   = ["iam:GetRole"]
     resources = [local.vault_role_pattern]
+  }
+
+  dynamic "statement" {
+    for_each = length(var.vault_snapshots.copy_to) > 0 ? [1] : []
+
+    content {
+      sid       = "SnapshotCopies"
+      effect    = "Allow"
+      actions   = ["s3:PutObject"]
+      resources = [for c in var.vault_snapshots.copy_to : "${c.bucket_arn}/vault/*"]
+    }
   }
 }

@@ -109,7 +109,7 @@ resource "aws_db_instance" "replica" {
   port                = local.db_port
 
   vpc_security_group_ids = [aws_security_group.this.id]
-  
+
   # skip_final_snapshot    = var.skip_final_snapshot
   skip_final_snapshot = true #  RDS does not take final snapshots of read replicas
   deletion_protection = var.deletion_protection

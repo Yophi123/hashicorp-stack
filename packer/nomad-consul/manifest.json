@@ -1,0 +1,23 @@
+{
+  "builds": [
+    {
+      "name": "nomad-consul-client",
+      "builder_type": "amazon-ebs",
+      "build_time": 1791537546,
+      "files": null,
+      "artifact_id": "ap-southeast-1:ami-096c515df9f80e26f,eu-west-1:ami-02730f251e5a63d5e",
+      "packer_run_uuid": "0c264a7e-af98-bbf0-ac7c-dd8bb6a382ab",
+      "custom_data": null
+    },
+    {
+      "name": "nomad-consul-client",
+      "builder_type": "amazon-ebs",
+      "build_time": 1791548462,
+      "files": null,
+      "artifact_id": "ap-southeast-1:ami-095fa711b109dfde7,eu-west-1:ami-0cdf80d3e16d6087b",
+      "packer_run_uuid": "2183d0b4-f3f4-4c15-630f-684cc864ef43",
+      "custom_data": null
+    }
+  ],
+  "last_run_uuid": "2183d0b4-f3f4-4c15-630f-684cc864ef43"
+}

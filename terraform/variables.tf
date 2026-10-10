@@ -10,7 +10,6 @@ variable "pilot_light_region" {
   default     = "eu-west-1"
 }
 
-
 variable "allowed_client_cidrs" {
   type        = list(string)
   description = <<-EOT
@@ -21,6 +20,6 @@ variable "allowed_client_cidrs" {
 }
 
 variable "hashicorp_stack_domain" {
-  type = string
+  type        = string
   description = "Public domain name that will be used"
 }

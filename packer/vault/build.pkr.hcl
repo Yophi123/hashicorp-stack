@@ -14,7 +14,7 @@ locals {
 
 source "amazon-ebs" "vault" {
   region        = var.region
-  # ami_regions   = var.ami_regions
+  ami_regions   = var.ami_regions
   instance_type = var.instance_type
   profile       = "packer"
   ami_name      = "vault-server-${local.timestamp}"
@@ -57,5 +57,9 @@ build {
       "echo '==> Cleaning up temporary upload directory...'",
       "rm -rf /tmp/scripts"
     ]
+  }
+  post-processor "manifest" {
+    output     = "${path.root}/manifest.json"
+    strip_path = true
   }
 }

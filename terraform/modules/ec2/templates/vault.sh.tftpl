@@ -97,6 +97,17 @@ stamp="$(date -u +%Y%m%dT%H%M%SZ)"
 aws s3 cp --only-show-errors --region "$${REGION}" "$${tmp}/vault.snap" "s3://$${BUCKET}/vault/history/$${stamp}.snap"
 aws s3 cp --only-show-errors --region "$${REGION}" "$${tmp}/vault.snap" "s3://$${BUCKET}/vault/latest.snap"
 echo "==> snapshot $${stamp} saved"
+%{ for c in snapshot_copies ~}
+
+# Second copy for the other site. A failure here must not fail the snapshot.
+if aws s3 cp --only-show-errors --region "${c.region}" "$${tmp}/vault.snap" "s3://${c.bucket_name}/vault/history/$${stamp}.snap" \
+  && aws s3 cp --only-show-errors --region "${c.region}" "$${tmp}/vault.snap" "s3://${c.bucket_name}/vault/latest.snap"; then
+  echo "==> snapshot $${stamp} copied to ${c.bucket_name}"
+else
+  echo "==> WARNING: copy to ${c.bucket_name} failed" >&2
+fi
+%{ endfor ~}
+
 SNAP
 chmod 0755 /usr/local/bin/vault-snapshot.sh
 
@@ -152,7 +163,6 @@ vault_initialized() {
 vault_has_data() {
   vault_initialized && [ ! -f "$${RESTORE_MARKER}" ]
 }
-
 vault_active() {
   curl -fsS "$${VAULT_ADDR}/v1/sys/leader" 2>/dev/null | jq -e '.is_self == true' >/dev/null
 }

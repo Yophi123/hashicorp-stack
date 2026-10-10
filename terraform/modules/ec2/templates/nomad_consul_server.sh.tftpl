@@ -29,6 +29,12 @@ ports {
   dns  = ${ports.consul.dns}
 }
 
+# Workaround for hashicorp/consul#23923: 2.0.4 servers close idle RPC streams.
+# Remove once the images pin a Consul version without the regression.
+limits {
+  rpc_handshake_timeout = "0s"
+}
+
 # Bootstrap posture: no gossip encryption, no mTLS, no ACLs. All three are
 # added once Vault is up and can issue the material.
 EOF

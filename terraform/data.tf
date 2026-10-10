@@ -5,8 +5,8 @@ data "aws_route53_zone" "public" {
 }
 
 data "aws_ami_ids" "hashicorp_stack_amis" {
-  owners      = ["self"]
-  
+  owners = ["self"]
+
   filter {
     name   = "tag:Project"
     values = ["hashicorp-stack"]
@@ -32,3 +32,34 @@ data "aws_ami_ids" "hashicorp_stack_amis" {
     values = ["ebs"]
   }
 }
+
+data "aws_ami_ids" "pilot_light_hashicorp_stack_amis" {
+  owners = ["self"]
+  region = var.pilot_light_region
+
+  filter {
+    name   = "tag:Project"
+    values = ["hashicorp-stack"]
+  }
+
+  filter {
+    name   = "tag:BuiltBy"
+    values = ["packer"]
+  }
+
+  filter {
+    name   = "state"
+    values = ["available"]
+  }
+
+  filter {
+    name   = "virtualization-type"
+    values = ["hvm"]
+  }
+
+  filter {
+    name   = "root-device-type"
+    values = ["ebs"]
+  }
+}
+
