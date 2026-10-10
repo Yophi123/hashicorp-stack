@@ -1,5 +1,74 @@
 ## Nomad + Consul control plane
 
+%{ if snapshot_bucket != "" ~}
+## Snapshot and restore helpers
+
+install -d -m 0755 /etc/hashistack /var/lib/hashistack
+
+cat > /etc/hashistack/server.env <<EOF
+REGION="$${REGION}"
+PRIVATE_IP="$${PRIVATE_IP}"
+SNAPSHOT_BUCKET="${snapshot_bucket}"
+EOF
+
+# snapshot_state <product>: 0 = a snapshot exists, 1 = none yet, 2 = cannot tell.
+snapshot_state() {
+  local err
+  for _ in 1 2 3; do
+    if err="$(aws s3api head-object --region "$${REGION}" \
+        --bucket "${snapshot_bucket}" --key "$${1}/latest.snap" 2>&1 >/dev/null)"; then
+      return 0
+    fi
+    if grep -Eq '\(404\)|Not Found' <<<"$${err}"; then
+      return 1
+    fi
+    sleep 5
+  done
+  echo "==> cannot tell whether a $${1} snapshot exists: $${err}" >&2
+  return 2
+}
+
+# wait_for_leader <status url>: the endpoint answers with an address once a leader exists.
+wait_for_leader() {
+  for _ in $(seq 1 60); do
+    if [ -n "$(curl -fsS "$${1}" 2>/dev/null | tr -d '"')" ]; then
+      return 0
+    fi
+    sleep 5
+  done
+  return 1
+}
+
+# restore_on_boot <product> <status url> <restore command...>
+# Runs once, on the first boot of a single-server cluster.
+restore_on_boot() {
+  local product="$${1}" status_url="$${2}" rc=0
+  local marker="/var/lib/hashistack/$${1}.restore-pending"
+  shift 2
+
+  # While this marker exists the snapshot timer skips this product, so a
+  # failed restore is never overwritten by a snapshot of an empty cluster.
+  touch "$${marker}"
+
+  snapshot_state "$${product}" || rc=$?
+  if [ "$${rc}" -eq 1 ]; then
+    echo "==> no $${product} snapshot yet, starting empty"
+    rm -f "$${marker}"
+    return 0
+  elif [ "$${rc}" -ne 0 ]; then
+    return 1
+  fi
+
+  wait_for_leader "$${status_url}" || { echo "==> $${product} has no leader, not restoring" >&2; return 1; }
+  aws s3 cp --only-show-errors --region "$${REGION}" \
+    "s3://${snapshot_bucket}/$${product}/latest.snap" "/tmp/$${product}.snap" || return 1
+  "$@" "/tmp/$${product}.snap" || return 1
+
+  rm -f "/tmp/$${product}.snap" "$${marker}"
+  echo "==> $${product} restored from s3://${snapshot_bucket}/$${product}/latest.snap"
+}
+
+%{ endif ~}
 # Consul server
 
 install -d -o consul -g consul -m 0750 /opt/consul /etc/consul.d
@@ -17,7 +86,12 @@ bind_addr      = "$${PRIVATE_IP}"
 advertise_addr = "$${PRIVATE_IP}"
 client_addr    = "0.0.0.0"
 
-retry_join     = ["provider=aws region=$${REGION} tag_key=${join_tag_key} tag_value=${consul_join_tag}"]
+# The second entry finds any node of this project. A replacement server uses
+# it to reach the running agents, which only know the old server's address.
+retry_join = [
+  "provider=aws region=$${REGION} tag_key=${join_tag_key} tag_value=${consul_join_tag}",
+  "provider=aws region=$${REGION} tag_key=Project tag_value=${project_name}"
+]
 retry_join_wan = ${jsonencode(wan_join)}
 
 ui_config {
@@ -41,6 +115,11 @@ EOF
 
 chown -R consul:consul /etc/consul.d
 start_service consul
+%{ if snapshot_bucket != "" && bootstrap_expect == 1 ~}
+
+restore_on_boot consul "http://127.0.0.1:${ports.consul.http}/v1/status/leader" consul snapshot restore \
+  || echo "==> WARNING: consul restore failed; consul snapshots are paused until this is resolved" >&2
+%{ endif ~}
 
 # Nomad server
 
@@ -82,3 +161,75 @@ EOF
 
 chown -R nomad:nomad /etc/nomad.d
 start_service nomad
+%{ if snapshot_bucket != "" && bootstrap_expect == 1 ~}
+
+restore_on_boot nomad "http://127.0.0.1:${ports.nomad.http}/v1/status/leader" nomad operator snapshot restore \
+  || echo "==> WARNING: nomad restore failed; nomad snapshots are paused until this is resolved" >&2
+%{ endif ~}
+%{ if snapshot_bucket != "" ~}
+
+# Snapshots. Terraform interpolates into the quoted heredoc below; bash does
+# not, so everything written as $${...} expands when the script runs.
+cat > /usr/local/bin/server-snapshot.sh <<'SNAP'
+#!/usr/bin/env bash
+# Saves Consul and Nomad raft snapshots to S3. The timer runs on every server;
+# for each product only its leader does the work.
+set -uo pipefail
+source /etc/hashistack/server.env
+
+stamp="$(date -u +%Y%m%dT%H%M%SZ)"
+tmp="$(mktemp -d)"
+trap 'rm -rf "$${tmp}"' EXIT
+rc=0
+
+# snapshot <product> <status url> <leader rpc port> <save command...>
+snapshot() {
+  local product="$${1}" leader
+  leader="$(curl -fsS "$${2}" 2>/dev/null | tr -d '"')"
+  [ "$${leader}" = "$${PRIVATE_IP}:$${3}" ] || return 0
+
+  if [ -f "/var/lib/hashistack/$${product}.restore-pending" ]; then
+    echo "==> $${product}: restore pending, snapshot skipped" >&2
+    return 1
+  fi
+
+  shift 3
+  "$@" "$${tmp}/$${product}.snap" >/dev/null \
+    && aws s3 cp --only-show-errors --region "$${REGION}" "$${tmp}/$${product}.snap" "s3://$${SNAPSHOT_BUCKET}/$${product}/history/$${stamp}.snap" \
+    && aws s3 cp --only-show-errors --region "$${REGION}" "$${tmp}/$${product}.snap" "s3://$${SNAPSHOT_BUCKET}/$${product}/latest.snap" \
+    && echo "==> $${product} snapshot $${stamp} saved"
+}
+
+snapshot consul "http://127.0.0.1:${ports.consul.http}/v1/status/leader" ${ports.consul.server_rpc} consul snapshot save || rc=1
+snapshot nomad "http://127.0.0.1:${ports.nomad.http}/v1/status/leader" ${ports.nomad.rpc} nomad operator snapshot save || rc=1
+exit "$${rc}"
+SNAP
+chmod 0755 /usr/local/bin/server-snapshot.sh
+
+cat > /etc/systemd/system/server-snapshot.service <<EOF
+[Unit]
+Description=Consul and Nomad raft snapshots to S3
+After=consul.service nomad.service
+
+[Service]
+Type=oneshot
+Environment=HOME=/root
+ExecStart=/usr/local/bin/server-snapshot.sh
+EOF
+
+cat > /etc/systemd/system/server-snapshot.timer <<EOF
+[Unit]
+Description=Consul and Nomad raft snapshots every ${snapshot_interval} minutes
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=${snapshot_interval}min
+AccuracySec=30s
+
+[Install]
+WantedBy=timers.target
+EOF
+
+systemctl daemon-reload
+systemctl enable --now server-snapshot.timer
+%{ endif ~}

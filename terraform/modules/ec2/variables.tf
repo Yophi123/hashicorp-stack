@@ -330,3 +330,19 @@ variable "init_secret_arns" {
   description = "Secrets Manager secrets that receive the first-boot init output. Each is required when enable_bootstrap_automation is on and its node group exists."
   default     = {}
 }
+
+## Consul and Nomad snapshots
+variable "server_snapshots" {
+  type = object({
+    bucket_name      = string
+    bucket_arn       = string
+    interval_minutes = optional(number, 10)
+  })
+  description = <<-EOT
+    S3 bucket for Consul and Nomad Raft snapshots. When set, the leader of each
+    saves a snapshot on a timer. A single-server cluster also restores the
+    latest snapshots on first boot, so replacing the server keeps its state.
+    Use a bucket in the same region; snapshots are never shared across regions.
+  EOT
+  default     = null
+}

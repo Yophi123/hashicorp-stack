@@ -166,9 +166,13 @@ module "alb" {
 module "snapshots" {
   source = "./modules/s3"
 
-  project_name      = "hashicorp-stack"
-  name              = "snapshots"
-  expiring_prefixes = { "vault/history/" = 7 }
+  project_name = "hashicorp-stack"
+  name         = "snapshots"
+  expiring_prefixes = {
+    "vault/history/"  = 7
+    "consul/history/" = 7
+    "nomad/history/"  = 7
+  }
 
   # Evaluation posture: allows a clean terraform destroy.
   force_destroy = true
@@ -181,10 +185,16 @@ module "snapshots_pilot_light" {
     aws = aws.pilot_light
   }
 
-  project_name      = "hashicorp-stack"
-  name              = "snapshots"
-  expiring_prefixes = { "vault/history/" = 7 }
-  force_destroy     = true
+  project_name = "hashicorp-stack"
+  name         = "snapshots"
+  expiring_prefixes = {
+    "vault/history/"  = 7
+    "consul/history/" = 7
+    "nomad/history/"  = 7
+  }
+
+  # Evaluation posture: allows a clean terraform destroy.
+  force_destroy = true
 }
 
 module "ec2" {
@@ -203,7 +213,7 @@ module "ec2" {
 
   # Can change the instance type based on requirements 
   node_groups = {
-    nomad_consul_server = { instance_type = "t3.small", data_volume_size = 10}
+    nomad_consul_server = { instance_type = "t3.small", data_volume_size = 10 }
     vault               = { instance_type = "t3.small", data_volume_size = 10 }
     boundary            = { instance_type = "t3.small", public_ip = true }
     nomad_worker        = { instance_type = "t3.medium", max_size = 3 }
@@ -238,12 +248,19 @@ module "ec2" {
   }
 
   # Federation
-   federation = {
+  federation = {
     consul_primary_datacenter  = var.region
     nomad_authoritative_region = var.region
     peer_vpc_cidrs             = [module.networking_pilot_light.vpc-cidr_block]
     peer_aws_regions           = [var.pilot_light_region]
   }
+
+  # Consul and Nomad Servers snapshots
+  server_snapshots = {
+    bucket_name = module.snapshots.bucket_name
+    bucket_arn  = module.snapshots.bucket_arn
+  }
+
 }
 
 module "ec2_pilot_light" {
@@ -258,6 +275,8 @@ module "ec2_pilot_light" {
   vpc_cidr     = module.networking_pilot_light.vpc-cidr_block
 
   private_subnet_ids = module.networking_pilot_light.app_subnet_ids
+
+  allowed_client_cidrs = var.allowed_client_cidrs
 
   consul_datacenter = var.pilot_light_region
   nomad_region      = var.pilot_light_region
@@ -291,7 +310,12 @@ module "ec2_pilot_light" {
     peer_aws_regions           = [var.region]
   }
 
-  allowed_client_cidrs = var.allowed_client_cidrs
+  # Consul and Nomad Pilot-Light server snapshots
+  server_snapshots = {
+    bucket_name = module.snapshots_pilot_light.bucket_name
+    bucket_arn  = module.snapshots_pilot_light.bucket_arn
+  }
 
-  depends_on = [ module.ec2 ]
+  depends_on = [module.ec2]
 }
+

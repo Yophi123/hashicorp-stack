@@ -153,6 +153,9 @@ locals {
       join_tag_key         = var.retry_join_tag_key
       consul_join_tag      = local.consul_join_tag
       wan_join             = local.wan_join
+      project_name         = var.project_name
+      snapshot_bucket      = try(var.server_snapshots.bucket_name, "")
+      snapshot_interval    = try(var.server_snapshots.interval_minutes, 10)
     }
 
     nomad_worker = {
@@ -372,6 +375,15 @@ resource "aws_iam_role_policy" "vault_snapshots" {
   name_prefix = "vault-snapshots-"
   role        = aws_iam_role.node["vault"].id
   policy      = data.aws_iam_policy_document.vault_snapshots[0].json
+}
+
+## Nomad and Consul Snapshots
+resource "aws_iam_role_policy" "server_snapshots" {
+  count = local.has_servers && var.server_snapshots != null ? 1 : 0
+
+  name_prefix = "server-snapshots-"
+  role        = aws_iam_role.node["nomad_consul_server"].id
+  policy      = data.aws_iam_policy_document.server_snapshots[0].json
 }
 
 ## Bootstrap automation

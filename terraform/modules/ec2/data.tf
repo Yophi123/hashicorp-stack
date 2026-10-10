@@ -226,3 +226,25 @@ data "aws_iam_policy_document" "vault_snapshots" {
     }
   }
 }
+
+data "aws_iam_policy_document" "server_snapshots" {
+  count = contains(keys(var.node_groups), "nomad_consul_server") && var.server_snapshots != null ? 1 : 0
+
+  statement {
+    sid     = "SnapshotObjects"
+    effect  = "Allow"
+    actions = ["s3:GetObject", "s3:PutObject"]
+    resources = [
+      "${var.server_snapshots.bucket_arn}/consul/*",
+      "${var.server_snapshots.bucket_arn}/nomad/*",
+    ]
+  }
+
+  # Without ListBucket, a missing snapshot reads as "access denied" instead of "not found".
+  statement {
+    sid       = "SnapshotList"
+    effect    = "Allow"
+    actions   = ["s3:ListBucket"]
+    resources = [var.server_snapshots.bucket_arn]
+  }
+}
