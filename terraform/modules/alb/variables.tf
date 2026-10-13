@@ -42,12 +42,24 @@ variable "services" {
     health_port    = optional(number)
     health_path    = string
     health_matcher = optional(string, "200")
+
+    # PRIMARY or SECONDARY makes the DNS record a Route 53 failover record.
+    # Leave unset for a plain record.
+    failover_role = optional(string)
   }))
   description = <<-EOT
     Services published on the ALB, routed by host header. Each becomes
     <hostname>.<public_zone_name>. node_group is the ec2 module group whose
     ASG registers with the target group; health_port defaults to port.
   EOT
+  
+  validation {
+    condition = alltrue([
+      for s in var.services :
+      contains(["PRIMARY", "SECONDARY"], coalesce(s.failover_role, "PRIMARY"))
+    ])
+    error_message = "failover_role must be PRIMARY, SECONDARY, or unset."
+  }
 }
 
 variable "allowed_client_cidrs" {

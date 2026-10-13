@@ -23,3 +23,26 @@ variable "hashicorp_stack_domain" {
   type        = string
   description = "Public domain name that will be used"
 }
+
+variable "public_apps" {
+  type = map(object({
+    port        = number
+    health_path = optional(string, "/")
+  }))
+  description = <<-EOT
+    Nomad workloads published on both load balancers, keyed by hostname, with
+    Route 53 failover between the regions. Each job must listen on the same
+    static host port given here.
+  EOT
+  default     = {}
+
+  validation {
+    condition     = alltrue([for a in var.public_apps : a.port >= 20000 && a.port <= 32000])
+    error_message = "Ports must be in 20000-32000, the range the worker security group opens to the load balancer."
+  }
+
+  validation {
+    condition     = !contains(keys(var.public_apps), "boundary")
+    error_message = "\"boundary\" is already used as a hostname."
+  }
+}

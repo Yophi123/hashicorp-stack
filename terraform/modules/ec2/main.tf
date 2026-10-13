@@ -299,6 +299,19 @@ resource "aws_vpc_security_group_egress_rule" "all" {
   ip_protocol       = "-1"
 }
 
+# SSH only from the Boundary worker. Hosts accept only Vault-signed certificates,
+# so an open port 22 is useless without a certificate brokered by Boundary.
+# resource "aws_vpc_security_group_ingress_rule" "boundary_ssh" {
+#   for_each = toset(["nomad_consul_server", "nomad_worker", "vault"])
+
+#   security_group_id            = aws_security_group.node[each.key].id
+#   referenced_security_group_id = aws_security_group.node["boundary"].id
+#   ip_protocol                  = "tcp"
+#   from_port                    = 22
+#   to_port                      = 22
+#   description                  = "SSH from Boundary"
+# }
+
 ## IAM
 resource "aws_iam_role" "node" {
   for_each = var.node_groups

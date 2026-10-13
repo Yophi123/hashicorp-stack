@@ -4,9 +4,13 @@ job "whoami" {
   group "web" {
     count = 1
 
+     # 1. Give upstream load balancers time to stop sending traffic
+    shutdown_delay = "30s"
+
     network {
       port "http" {
-        to = 80
+        static = 28080
+        to     = 80
       }
     }
 
@@ -29,6 +33,7 @@ job "whoami" {
       config {
         image = "traefik/whoami:v1.10"
         ports = ["http"]
+        args  = ["--name", "${node.region}"]
       }
 
       resources {

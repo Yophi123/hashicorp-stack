@@ -1,3 +1,14 @@
+locals {
+  public_app_services = {
+    for name, app in var.public_apps : name => {
+      hostname    = name
+      node_group  = "nomad_worker"
+      port        = app.port
+      health_path = app.health_path
+    }
+  }
+}
+
 ## Networking
 # VPC
 module "networking" {
@@ -152,14 +163,44 @@ module "alb" {
   allowed_client_cidrs = var.allowed_client_cidrs
 
   # Only Boundary is public. Everything else is reached through it.
+  services = merge(
+    {
+      boundary = {
+        hostname    = "boundary"
+        node_group  = "boundary"
+        port        = module.ec2.ports.boundary.api
+        health_port = module.ec2.ports.boundary.ops
+        health_path = "/health"
+      }
+    },
+
+    # Public Apps to be run
+    { for name, svc in local.public_app_services : name => merge(svc, {
+      failover_role = "PRIMARY"
+    }) }
+  )
+}
+
+module "alb_pilot_light" {
+  source = "./modules/alb"
+
+  providers = {
+    aws = aws.pilot_light
+  }
+
+  project_name      = "hashicorp-stack"
+  vpc_id            = module.networking_pilot_light.vpc-id
+  vpc_cidr          = module.networking_pilot_light.vpc-cidr_block
+  public_subnet_ids = module.networking_pilot_light.web_subnet_ids
+
+  public_zone_name     = var.hashicorp_stack_domain
+  allowed_client_cidrs = var.allowed_client_cidrs
+
+  # Always on, with no targets until the workers are scaled up.
   services = {
-    boundary = {
-      hostname    = "boundary"
-      node_group  = "boundary"
-      port        = module.ec2.ports.boundary.api
-      health_port = module.ec2.ports.boundary.ops
-      health_path = "/health"
-    }
+    for name, svc in local.public_app_services : name => merge(svc, {
+      failover_role = "SECONDARY"
+    })
   }
 }
 
@@ -315,6 +356,8 @@ module "ec2_pilot_light" {
     bucket_name = module.snapshots_pilot_light.bucket_name
     bucket_arn  = module.snapshots_pilot_light.bucket_arn
   }
+
+  target_group_arns = module.alb_pilot_light.target_group_arns
 
   depends_on = [module.ec2]
 }

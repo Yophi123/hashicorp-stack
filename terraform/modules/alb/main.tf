@@ -1,8 +1,3 @@
-data "aws_route53_zone" "public" {
-  name         = var.public_zone_name
-  private_zone = false
-}
-
 locals {
   tags      = merge(var.tags, { Project = var.project_name })
   zone_name = trimsuffix(data.aws_route53_zone.public.name, ".")
@@ -172,9 +167,21 @@ resource "aws_route53_record" "service" {
   name    = local.fqdns[each.key]
   type    = "A"
 
+  # A failover pair is two records with the same name, told apart by this.
+  set_identifier = each.value.failover_role == null ? null : "${each.key}-${data.aws_region.current.region}"
+
+  dynamic "failover_routing_policy" {
+    for_each = each.value.failover_role == null ? [] : [each.value.failover_role]
+    content {
+      type = failover_routing_policy.value
+    }
+  }
+
   alias {
-    name                   = aws_lb.this.dns_name
-    zone_id                = aws_lb.this.zone_id
+    name    = aws_lb.this.dns_name
+    zone_id = aws_lb.this.zone_id
+    # Route 53 follows the load balancer's own target health; no separate
+    # health check is needed, and none has to reach the load balancer.
     evaluate_target_health = true
   }
 }

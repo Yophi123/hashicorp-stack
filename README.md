@@ -8,20 +8,25 @@
 ![Boundary](https://img.shields.io/badge/Boundary-EC585D?style=for-the-badge&logo=hashicorp&logoColor=white)
 ![AWS](https://img.shields.io/badge/AWS-FF9900?style=for-the-badge)
 
-A self-hosted, two-region platform on AWS built entirely from HashiCorp's
-community editions: Consul for service discovery, Nomad for workload
-scheduling, Vault for secrets, and Boundary for access. Packer bakes the
-machine images and one Terraform root provisions both regions.
+A self-hosted platform on AWS that spans two regions, built entirely from
+HashiCorp's community editions. Consul handles service discovery, Nomad
+schedules workloads, Vault holds secrets, and Boundary controls access. Packer
+bakes the machine images. One Terraform root provisions both regions, and a
+second root configures the services running on them.
 
-The primary region runs the full platform. The second region is a pilot light:
-one small server stays on and federated, and everything else is scaled to zero
-with its data already replicated there.
+The primary region runs the full platform. The second region is a pilot light.
+One small server stays on and federated, a load balancer waits behind a
+Route 53 failover record, and everything else is scaled to zero with its data
+already replicated there. A pair of scripts moves the platform to the pilot
+light and back.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
     user([Operator])
+    visitor([Visitor])
+    r53{{"Route 53<br/>failover record"}}
 
     subgraph P["ap-southeast-1, primary"]
         alb["Application Load Balancer<br/>HTTPS"]
@@ -34,16 +39,24 @@ flowchart LR
     end
 
     subgraph L["eu-west-1, pilot light"]
+        alb2["Application Load Balancer<br/>HTTPS"]
         srv2["Consul server<br/>Nomad server"]
         vault2["Vault<br/>scaled to zero"]
         wrk2["Nomad workers<br/>scaled to zero"]
         s3l[("S3 snapshots")]
     end
 
+    visitor --> r53
+    r53 -->|"PRIMARY"| alb
+    r53 -.->|"SECONDARY"| alb2
+    alb -->|"public apps"| wrk
+    alb2 -.->|"public apps"| wrk2
+
     user -->|"UI and API"| alb --> bnd
     user -->|"session traffic"| bnd
     bnd -->|"proxied sessions"| srv & vault & wrk
     bnd --> rds
+
     srv <-->|"federation over VPC peering"| srv2
     vault -->|"snapshot"| s3p
     vault -->|"second copy"| s3l
@@ -56,7 +69,7 @@ flowchart LR
 |---|---|---|---|
 | `nomad_consul_server` | Consul server, Nomad server | 1 | 1 |
 | `vault` | Vault with integrated Raft storage, Consul client | 1 | 0, scaled up at failover |
-| `nomad_worker` | Nomad client, Docker, Consul client | 1 | 0, scaled up at failover |
+| `nomad_worker` | Nomad client, Docker, Consul client | 1 | 0, up to 3 at failover |
 | `boundary` | Boundary controller and worker, Consul client | 1 | not deployed yet |
 
 Each group is an Auto Scaling group, sized for an account limited to 8 vCPU per
@@ -65,12 +78,15 @@ takes its own instance type.
 
 ## Design principles
 
-- **One way in.** Only Boundary is published, over HTTPS, to an allow-list of
-  client addresses. Vault, Nomad, Consul and every host are reached through it.
-- **No SSH key pairs.** Instances launch without one. Systems Manager is the
-  break-glass path.
+- **One way in.** Only Boundary and the public apps are published over HTTPS,
+  to an allow-list of client addresses. Vault, Nomad, Consul and every host
+  are reached through Boundary.
+- **No SSH key pairs.** Instances launch without one. Hosts trust only
+  short-lived certificates signed by Vault's SSH certificate authority, and
+  Systems Manager is the break-glass path.
 - **Immutable images.** Software is installed at image build time. Instances
-  only receive configuration at boot.
+  only receive configuration at boot, and changes roll out through a fresh
+  `terraform apply`.
 - **Discovery through Consul.** Nodes find their cluster by cloud auto-join
   tags and find services as `*.service.consul`, including across regions as
   `*.service.<datacenter>.consul`.
@@ -79,12 +95,16 @@ takes its own instance type.
   boot. Replacing a node is a routine operation.
 - **No secrets in Terraform state.** The database password and the Vault and
   Boundary bootstrap credentials are generated outside state and kept in
-  Secrets Manager.
+  Secrets Manager. The configuration root reads Vault's root token as an
+  ephemeral value.
 - **One KMS key per purpose.** Vault's unseal key is multi-region, so a
   snapshot taken in one region unseals in the other.
 - **Federated, not stretched.** Each region is its own Consul datacenter and
   Nomad region with its own Raft cluster. They share discovery and job
   submission, not state.
+- **Nothing deployment-specific is hard-coded.** Regions, project name and
+  apps come from Terraform variables, and the scripts take them as flags,
+  environment variables or prompts.
 
 ## Prerequisites
 
@@ -94,15 +114,16 @@ takes its own instance type.
 | Packer | With the `amazon` plugin, `~> 1.8` |
 | AWS CLI | A current version 2, plus the Session Manager plugin |
 | Boundary CLI | Or the Boundary Desktop app, to open sessions |
-| `jq` | Used by the commands in this README |
+| `jq` | Used by the scripts and the commands in this README |
 | AWS profiles | `packer` for image builds and `terraform` for provisioning |
 | Domain | A Route 53 public hosted zone that already exists |
 | Quota | 8 on-demand vCPU in each region |
 
 ## 1. Build the images
 
-Four images, each from Ubuntu 26.04 on amd64. Terraform selects the newest
-image for each role by its `Role` tag, in whichever region it is deploying to.
+There are four images, each built from Ubuntu 26.04 on amd64. Terraform
+selects the newest image for each role by its `Role` tag, in whichever region
+it is deploying to.
 
 | Image | `Role` tag | Installed | Needed in |
 |---|---|---|---|
@@ -111,10 +132,15 @@ image for each role by its `Role` tag, in whichever region it is deploying to.
 | Vault | `vault-control-plane` | Vault, Consul | both regions |
 | Boundary | `boundary-plane` | Boundary, Consul, PostgreSQL client | primary |
 
-Every image also carries the AWS CLI and `jq`, `.consul` DNS forwarding to the
-local Consul agent, and trust for Vault's SSH certificate authority. Services
-are installed but left disabled, so nothing starts before its configuration is
-written at boot.
+Every image also carries:
+
+- the AWS CLI and `jq`
+- `.consul` DNS forwarding to the local Consul agent, through systemd-resolved
+  (`DNS=127.0.0.1:8600`, `Domains=~consul`)
+- trust for Vault's SSH certificate authority
+
+Services are installed but left disabled, so nothing starts before its
+configuration is written at boot.
 
 From each image's directory:
 
@@ -139,11 +165,16 @@ done
 
 ## 2. Provision both regions
 
-Create `terraform.tfvars` in the Terraform root. Keep it out of version control.
+Create `terraform.tfvars` in the Terraform root and keep it out of version
+control.
 
 ```hcl
 hashicorp_stack_domain = "example.com"
 allowed_client_cidrs   = ["203.0.113.10/32"]
+
+public_apps = {
+  whoami = { port = 28080 }
+}
 ```
 
 ```bash
@@ -152,7 +183,7 @@ terraform apply
 ```
 
 One apply builds both regions. Vault and Boundary initialize themselves on
-first boot; allow about five minutes before logging in.
+first boot, so allow about five minutes before logging in.
 
 ### Variables
 
@@ -161,7 +192,19 @@ first boot; allow about five minutes before logging in.
 | `region` | `ap-southeast-1` | Primary region. Also the Consul datacenter and Nomad region name. |
 | `pilot_light_region` | `eu-west-1` | Pilot-light region, named the same way. |
 | `hashicorp_stack_domain` | required | Public hosted zone. Boundary is published at `boundary.<domain>`. |
-| `allowed_client_cidrs` | required | Addresses allowed to reach the load balancer and the Boundary worker. |
+| `allowed_client_cidrs` | required | Addresses allowed to reach the load balancers and the Boundary worker. |
+| `public_apps` | `{}` | Nomad workloads published on both load balancers, keyed by hostname, with Route 53 failover between the regions. Each needs a static host port in 20000–32000, plus an optional `health_path`. |
+
+### Outputs
+
+| Name | Description |
+|---|---|
+| `boundary_url` | Boundary's public URL |
+| `public_app_urls` | URL per public app, served by whichever region is healthy |
+| `vault_init_secret_arn`, `boundary_init_secret_arn` | Where the bootstrap credentials are kept |
+| `autoscaling_group_names` | Auto Scaling groups in the primary |
+| `pilot_light_autoscaling_group_names` | Auto Scaling groups in the pilot light |
+| `iam_role_arns` | Instance role per node group |
 
 ### Modules
 
@@ -174,76 +217,78 @@ first boot; allow about five minutes before logging in.
 | `rds` | PostgreSQL for Boundary, with the password kept out of state | primary |
 | `s3` | Private, encrypted snapshot bucket with expiring history | both regions |
 | `secrets` | Init secrets for Vault and Boundary; Vault's is replicated | primary |
-| `alb` | Public load balancer, wildcard certificate and DNS records | primary |
+| `alb` | Public load balancer, wildcard certificate, target groups and DNS records. Each service's `failover_role` makes its record a Route 53 `PRIMARY` or `SECONDARY` failover alias. | both regions |
 | `ec2` | Node groups, IAM roles, first-boot init, snapshots and restore | both regions |
 
 The second region is the same modules called again through a provider alias,
 `aws.pilot_light`.
 
-## 3. Working with the platform
+## 3. Configure Vault
 
-Set these once per shell. Every command in this README uses them, and none of
-them depends on Terraform outputs.
+The `config/` directory is a second Terraform root. It configures Vault
+through its API, so it runs after the infrastructure root and needs a tunnel
+to Vault. Today it creates Vault's SSH certificate authority, the
+`host-access` role that issues five-minute certificates, and the policy
+Boundary will use. Boundary's configuration comes next.
 
 ```bash
-export PROJECT=hashicorp-stack PRIMARY=ap-southeast-1 PILOT=eu-west-1
+# terminal 1: tunnel to Vault, left running
+aws ssm start-session --region "$PRIMARY_REGION" --target "$(node_id "$PRIMARY_REGION" vault)" \
+  --document-name AWS-StartPortForwardingSession \
+  --parameters '{"portNumber":["8200"],"localPortNumber":["8200"]}'
 
-# node_id <region> <role>   roles: nomad_consul_server, nomad_worker, vault, boundary
-node_id() {
-  aws ec2 describe-instances --region "$1" \
-    --filters "Name=tag:Project,Values=$PROJECT" "Name=tag:Role,Values=$2" \
-              "Name=instance-state-name,Values=running" \
-    --query 'Reservations[].Instances[].InstanceId' --output text
-}
-
-# shell <region> <role>     open a shell on that node
-shell() { aws ssm start-session --region "$1" --target "$(node_id "$1" "$2")"; }
-
-# asg <region> <role>       name of that role's Auto Scaling group
-asg() {
-  aws autoscaling describe-auto-scaling-groups --region "$1" \
-    --query "AutoScalingGroups[?starts_with(AutoScalingGroupName, '$PROJECT-$2-')].AutoScalingGroupName | [0]" \
-    --output text
-}
-
-# bucket <region>           name of that region's snapshot bucket
-bucket() {
-  aws s3api list-buckets --prefix "$PROJECT-snapshots-" --bucket-region "$1" \
-    --query 'Buckets[0].Name' --output text
-}
-
-# secret <vault|boundary> [region]   print an init secret as JSON
-secret() {
-  local region="${2:-$PRIMARY}" arn
-  arn=$(aws secretsmanager list-secrets --region "$region" \
-    --filters Key=name,Values="$PROJECT/$1/init-" \
-    --query 'sort_by(SecretList, &CreatedDate)[-1].ARN' --output text)
-  aws secretsmanager get-secret-value --region "$region" --secret-id "$arn" \
-    --query SecretString --output text
-}
-
-# replace <region> <role>   terminate the node; its group launches a new one
-replace() {
-  date -u
-  aws autoscaling terminate-instance-in-auto-scaling-group --region "$1" \
-    --instance-id "$(node_id "$1" "$2")" --no-should-decrement-desired-capacity
-}
+# terminal 2
+cd config && terraform init
+AWS_PROFILE=terraform terraform apply -var "project_name=$PROJECT" -var "region=$PRIMARY_REGION"
 ```
+
+[config/README.md](config/README.md) covers why it is separate, the checks, how
+SSH certificates work, and the Community Edition limit on credential
+brokering.
+
+## 4. Working with the platform
+
+`scripts/helpers.sh` holds shell functions for everyday tasks. It contains no
+deployment values. Set three variables, then source the file, in every new
+terminal:
+
+```bash
+export PROJECT=hashicorp-stack PRIMARY_REGION=ap-southeast-1 PILOT_REGION=eu-west-1
+source scripts/helpers.sh
+
+export WHOAMI="$(terraform output -json public_app_urls | jq -r '.whoami')"
+```
+
+If any of the three is missing, the helpers refuse to run and say which one.
+To avoid retyping, keep the exports in a git-ignored `.env` file and source it
+before the helpers.
+
+| Function | Does |
+|---|---|
+| `node_id <region> <role>` | Instance ID of the running node. Roles: `nomad_consul_server`, `nomad_worker`, `vault`, `boundary`. |
+| `shell <region> <role>` | Opens a Systems Manager shell on that node |
+| `asg <region> <role>` | Name of that role's Auto Scaling group |
+| `bucket <region>` | Name of that region's snapshot bucket |
+| `secret <vault\|boundary> [region]` | Prints an init secret as JSON; the region defaults to the primary |
+| `replace <region> <role>` | Terminates the node; its group launches a new one |
+| `alb_dns <region>` | DNS name of that region's load balancer |
+| `tg_health <region> [prefix]` | Target health of a target group; the prefix defaults to `whoami` |
 
 ### Log in
 
 ```bash
-secret boundary | jq '.auth_method'      # auth_method_id, login_name, password
-secret vault | jq -r '.root_token'       # Vault root token
-secret vault "$PILOT" | jq -r '.root_token'   # the same token, read from the replica
+secret boundary | jq '.auth_method'                 # auth_method_id, login_name, password
+secret vault | jq -r '.root_token'                  # Vault root token
+secret vault "$PILOT_REGION" | jq -r '.root_token'  # the same token, read from the replica
 
 export BOUNDARY_ADDR="https://boundary.<domain>"
 boundary authenticate password -auth-method-id <ampw_...> -login-name admin
 ```
 
 Vault, Nomad and Consul are reached as Boundary TCP targets, addressed by their
-Consul DNS names. The targets are created by hand in Boundary's admin UI for
-now, and need recreating after a full rebuild.
+Consul DNS names. For now, the targets are created by hand in Boundary's admin
+UI and need recreating after a full rebuild. Step 4 part 2 moves them into
+`config/`.
 
 | Target | Address | Port | Local URL after `boundary connect` |
 |---|---|---|---|
@@ -259,7 +304,7 @@ boundary connect -target-id <ttcp_...>
 ### Verify a fresh build
 
 ```bash
-shell $PRIMARY nomad_consul_server
+shell $PRIMARY_REGION nomad_consul_server
 ```
 
 ```bash
@@ -271,7 +316,7 @@ nomad node status              # workers, ready
 systemctl list-timers --all | grep -E "snapshot|fetch-ssh-ca"
 ```
 
-On the Vault node (`shell $PRIMARY vault`):
+On the Vault node (`shell $PRIMARY_REGION vault`):
 
 ```bash
 export VAULT_ADDR=http://127.0.0.1:8200
@@ -279,14 +324,17 @@ vault status                                    # Initialized true, Sealed false
 sudo journalctl -u vault-bootstrap --no-pager | grep "==>"
 ```
 
-On the Boundary node (`shell $PRIMARY boundary`):
+On the Boundary node (`shell $PRIMARY_REGION boundary`):
 
 ```bash
 systemctl is-active boundary
 curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:9203/health    # 200
 ```
 
-### Deploy a test workload
+### Deploy the test workload
+
+`jobs/whoami.nomad.hcl` is the test app behind `public_apps`. It listens on
+the same static host port in both regions and reports which region answered.
 
 ```hcl
 job "whoami" {
@@ -294,10 +342,14 @@ job "whoami" {
 
   group "web" {
     count = 1
+    
+    # 1. Give upstream load balancers time to stop sending traffic
+    shutdown_delay = "30s"
 
     network {
       port "http" {
-        to = 80
+        static = 28080
+        to     = 80
       }
     }
 
@@ -320,6 +372,7 @@ job "whoami" {
       config {
         image = "traefik/whoami:v1.10"
         ports = ["http"]
+        args  = ["--name", "${node.region}"]
       }
 
       resources {
@@ -332,12 +385,20 @@ job "whoami" {
 ```
 
 ```bash
-nomad job run whoami.nomad.hcl
+# through a Boundary session to Nomad, or on the server node
+nomad job run jobs/whoami.nomad.hcl
 nomad job status whoami
 resolvectl query whoami.service.consul
+
+# laptop
+tg_health $PRIMARY_REGION             # healthy
+curl -s "$WHOAMI" | grep Name         # Name: ap-southeast-1
 ```
 
-## 4. Snapshots and restore
+To publish a real application, add it to `public_apps` and give its job the
+same static port. No code changes are needed.
+
+## 5. Snapshots and restore
 
 | Service | Saved by | Key in the region's bucket | Restored when |
 |---|---|---|---|
@@ -350,11 +411,13 @@ resolvectl query whoami.service.consul
 - Vault's snapshots are written to both regions' buckets, so the pilot-light
   site always holds a recent copy. Consul and Nomad snapshots stay in their own
   region, because each region is a separate cluster.
+- Vault's configuration, including the SSH CA from `config/`, is part of its
+  snapshots.
 - After a Vault restore, the original root token and recovery keys apply.
 - If a restore fails, a marker file pauses that service's snapshots so an empty
   cluster can never overwrite a good snapshot.
-- Anything written after the last snapshot is lost when a single node is
-  replaced. That window is at most the snapshot interval.
+- When a single node is replaced, anything written after the last snapshot is
+  lost. That window is at most the snapshot interval.
 
 ```bash
 # take snapshots now (on the node)
@@ -364,12 +427,8 @@ sudo journalctl -u vault-snapshot --no-pager | tail -n 4
 sudo journalctl -u server-snapshot --no-pager | tail -n 4
 
 # what is stored (laptop)
-aws s3 ls "s3://$(bucket $PRIMARY)/" --recursive --region $PRIMARY
-aws s3 ls "s3://$(bucket $PILOT)/" --recursive --region $PILOT
-
-# what the last boot did (on the node)
-sudo journalctl -u vault-bootstrap --no-pager | grep "==>"       # Vault node
-sudo grep -E "snapshot yet|restored|WARNING" /var/log/user-data.log   # server node
+aws s3 ls "s3://$(bucket $PRIMARY_REGION)/" --recursive --region $PRIMARY_REGION
+aws s3 ls "s3://$(bucket $PILOT_REGION)/" --recursive --region $PILOT_REGION
 ```
 
 Test a restore end to end:
@@ -380,7 +439,7 @@ consul kv put canary before-restore
 sudo systemctl start server-snapshot
 
 # laptop
-replace $PRIMARY nomad_consul_server
+replace $PRIMARY_REGION nomad_consul_server
 
 # on the new server node, after about three minutes
 sudo grep -E "restored|WARNING" /var/log/user-data.log
@@ -392,17 +451,17 @@ consul members
 To start a service from nothing instead of restoring, empty its prefix first:
 
 ```bash
-aws s3 rm "s3://$(bucket $PRIMARY)/consul/" --recursive --region $PRIMARY
+aws s3 rm "s3://$(bucket $PRIMARY_REGION)/consul/" --recursive --region $PRIMARY_REGION
 ```
 
-## 5. The pilot-light region and federation
+## 6. The pilot-light region and federation
 
-`eu-west-1` keeps one Consul and Nomad server running. Its Vault and worker
-groups exist at zero instances, with their images, roles, key replica and
-snapshots already in place.
+`eu-west-1` keeps one Consul and Nomad server and its load balancer running.
+Its Vault and worker groups exist at zero instances, with their images, roles,
+key replica and snapshots already in place.
 
 ```bash
-shell $PILOT nomad_consul_server
+shell $PILOT_REGION nomad_consul_server
 ```
 
 ```bash
@@ -412,55 +471,132 @@ consul catalog services -datacenter=ap-southeast-1
 resolvectl query vault.service.ap-southeast-1.consul
 ```
 
-Run a workload in the pilot-light region from the primary:
+A job can be submitted to the pilot-light region from the primary with
+`-region eu-west-1`, once a worker is running there. Its service then resolves
+from the primary as `<service>.service.eu-west-1.consul`.
+
+### DNS failover
+
+Each public app has two Route 53 alias records with the same name: `PRIMARY`
+pointing at the primary load balancer and `SECONDARY` at the pilot light's,
+both with `evaluate_target_health`. When the primary's targets for that app are
+all unhealthy, Route 53 answers with the pilot light. Once the primary is
+healthy again, Route 53 moves back by itself.
+
+- **Browsers hold connections open** across DNS changes. Test with `curl` or a
+  new private window, not a tab that is already open.
+- **A load balancer fails open.** If a target is registered but nothing
+  answers on its port (for example, a worker running with no job), that region
+  returns 502 until Route 53 notices the failed health checks. During failover,
+  that 502 from the primary is expected.
 
 ```bash
-# laptop: bring up a worker there
-aws autoscaling set-desired-capacity --region $PILOT \
-  --auto-scaling-group-name "$(asg $PILOT nomad_worker)" --desired-capacity 1
-
-# primary server node, or a Boundary session to the primary Nomad
-nomad node status -region eu-west-1
-nomad job run -region eu-west-1 whoami.nomad.hcl
-nomad job status -region eu-west-1 whoami
-resolvectl query whoami.service.eu-west-1.consul
-
-# laptop: scale back down
-nomad job stop -region eu-west-1 whoami
-aws autoscaling set-desired-capacity --region $PILOT \
-  --auto-scaling-group-name "$(asg $PILOT nomad_worker)" --desired-capacity 0
+dig +short "${WHOAMI#https://}"                     # which load balancer is answering
+tg_health $PRIMARY_REGION; tg_health $PILOT_REGION
+curl -s "$WHOAMI" | grep Name                       # which region served the request
 ```
 
-Vault in the pilot-light region restores from the replicated snapshot and
-unseals with the replica key. Do not run it while the primary Vault is active:
-both would write snapshots to the same bucket.
+## 7. Failover and failback
 
-## 6. Command reference
+Both scripts take every value as a flag, an environment variable, or a prompt
+when run in a terminal. Run either one with `--help` for its options. Each run
+writes a timestamped log file, `failover-<time>.log` or `failback-<time>.log`,
+in the current directory.
 
-Commands marked **laptop** use the helpers from section 3. The rest run on a
+### Fail over
+
+`scripts/failover.sh` talks only to the pilot-light region's APIs, plus one
+brief, time-limited check of the primary, so it works when the primary is
+down.
+
+1. It refuses to start if the primary Vault still looks active (override with
+   `--force`).
+2. It scales up the pilot-light Vault and waits for it to restore from the
+   replicated snapshot and unseal.
+3. It scales up the workers and waits for them to join Nomad.
+4. It submits the job files to the pilot-light region.
+5. It waits for the load balancer targets, and optionally for the public URL.
+6. It prints the recovery time and the age of the Vault data it restored.
+
+```bash
+./scripts/failover.sh \
+  --project "$PROJECT" --primary-region "$PRIMARY_REGION" --pilot-region "$PILOT_REGION" \
+  --workers 1 --job-file jobs/whoami.nomad.hcl --url "$WHOAMI"
+```
+
+| Flag | Environment | Default |
+|---|---|---|
+| `--project` | `PROJECT` | prompted |
+| `--primary-region` | `PRIMARY_REGION` | prompted |
+| `--pilot-region` | `PILOT_REGION` | prompted |
+| `--workers` | `WORKERS` | `1` |
+| `--job-file` (repeatable) | | none |
+| `--url` | `APP_URL` | none |
+| `--force`, `--yes` | | off |
+
+### Fail back
+
+`scripts/failback.sh` follows an order that keeps Vault to a single writer and
+never sends traffic to a region that can't answer.
+
+1. It stops any primary Vault that is still running, because that Vault holds
+   data from before the failover.
+2. It takes a fresh snapshot of the pilot-light Vault, stops it, and copies the
+   snapshot into the primary bucket.
+3. It starts the primary Vault, which restores that snapshot.
+4. It starts the primary workers and jobs, and waits until the load balancer
+   reports them healthy.
+5. It stops the pilot-light jobs and scales the pilot light back to cold.
+
+```bash
+./scripts/failback.sh \
+  --project "$PROJECT" --primary-region "$PRIMARY_REGION" --pilot-region "$PILOT_REGION" \
+  --workers 1 --vault-nodes 1 --job-file jobs/whoami.nomad.hcl --url "$WHOAMI"
+```
+
+It takes the same flags as failover, without `--force`, plus these:
+
+| Flag | Environment | Effect |
+|---|---|---|
+| `--vault-nodes` | `VAULT_NODES` | Primary Vault nodes to start: 1, 3 or 5 (default 1) |
+| `--skip-vault-data` | | The primary restores from its own last snapshot, discarding writes made during the failover |
+| `--keep-pilot-jobs` | | Leaves the pilot-light jobs registered |
+
+When it finishes, run `terraform apply` in the infrastructure root so the
+group sizes match the code again. The plan should show only those capacity
+changes.
+
+## 8. Command reference
+
+Commands marked **laptop** use the helpers from section 4. The rest run on a
 node.
 
 ### Nodes (laptop)
 
 ```bash
 # every node in both regions
-for r in $PRIMARY $PILOT; do
+for r in $PRIMARY_REGION $PILOT_REGION; do
   aws ec2 describe-instances --region "$r" \
     --filters "Name=tag:Project,Values=$PROJECT" "Name=instance-state-name,Values=running" \
     --query 'Reservations[].Instances[].[Tags[?Key==`Role`]|[0].Value, InstanceId, PrivateIpAddress, InstanceType, LaunchTime]' \
     --output table
 done
 
-shell $PRIMARY vault                # open a shell on a node
-replace $PRIMARY nomad_worker       # replace a node
+shell $PRIMARY_REGION vault                # open a shell on a node
+replace $PRIMARY_REGION nomad_worker       # replace a node
 
 # why a group is not launching
-aws autoscaling describe-scaling-activities --region $PRIMARY \
-  --auto-scaling-group-name "$(asg $PRIMARY vault)" --max-items 3 \
+aws autoscaling describe-scaling-activities --region $PRIMARY_REGION \
+  --auto-scaling-group-name "$(asg $PRIMARY_REGION vault)" --max-items 3 \
   --query 'Activities[].[StatusCode, StatusMessage]' --output text
 
+# group sizes, for example after a failover
+aws autoscaling describe-auto-scaling-groups --region $PILOT_REGION \
+  --query "AutoScalingGroups[?starts_with(AutoScalingGroupName, '$PROJECT-')].[AutoScalingGroupName, MinSize, DesiredCapacity, MaxSize]" \
+  --output table
+
 # forward a port without Boundary, as a break-glass path
-aws ssm start-session --region $PRIMARY --target "$(node_id $PRIMARY vault)" \
+aws ssm start-session --region $PRIMARY_REGION --target "$(node_id $PRIMARY_REGION vault)" \
   --document-name AWS-StartPortForwardingSession \
   --parameters '{"portNumber":["8200"],"localPortNumber":["8200"]}'
 ```
@@ -468,7 +604,7 @@ aws ssm start-session --region $PRIMARY --target "$(node_id $PRIMARY vault)" \
 ### One command on every node (laptop)
 
 ```bash
-for r in $PRIMARY $PILOT; do
+for r in $PRIMARY_REGION $PILOT_REGION; do
   id=$(aws ssm send-command --region "$r" --document-name AWS-RunShellScript \
     --targets "Key=tag:Project,Values=$PROJECT" \
     --parameters 'commands=["cloud-init status; systemctl list-units --no-legend --plain consul.service nomad.service vault.service boundary.service"]' \
@@ -539,7 +675,8 @@ nomad job stop [-region <region>] <job>
 
 ### Vault
 
-On the Vault node, or from a laptop with a Boundary session open to it:
+On the Vault node, or from a laptop with a Boundary session or tunnel open to
+it:
 
 ```bash
 export VAULT_ADDR=http://127.0.0.1:8200
@@ -551,12 +688,12 @@ vault operator raft list-peers
 vault secrets list
 vault auth list
 
-vault secrets enable -path=secret kv-v2
-vault kv put secret/canary value=before-restore
-vault kv get secret/canary
-
 vault policy read snapshot                 # what the node's snapshot login may do
 vault read auth/aws/role/snapshot
+
+vault read ssh/roles/host-access           # from config/
+vault policy read boundary-controller      # from config/
+curl -s $VAULT_ADDR/v1/ssh/public_key      # the CA the hosts trust
 ```
 
 ### Boundary
@@ -574,44 +711,58 @@ curl -s -o /dev/null -w '%{http_code}\n' "$BOUNDARY_ADDR"
 
 | Result | Meaning |
 |---|---|
-| 200 | DNS, certificate, load balancer and Boundary all working |
-| 503 | Load balancer is up but Boundary is unhealthy |
+| 200 | DNS, certificate, load balancer and the service all working |
+| 502 | A target is registered but nothing answers on its port |
+| 503 | The load balancer is up but has no healthy targets |
 | 404 | The hostname did not match a routing rule |
 | Timeout | Your address is not in `allowed_client_cidrs` |
+
+### Load balancers and DNS (laptop)
+
+```bash
+alb_dns $PRIMARY_REGION
+tg_health $PRIMARY_REGION whoami
+
+# ask one region's load balancer directly, bypassing failover DNS
+curl -s -o /dev/null -w '%{http_code}\n' \
+  --connect-to "${WHOAMI#https://}:443:$(alb_dns $PILOT_REGION):443" "$WHOAMI"
+
+dig +short boundary.<domain>
+dig +short NS <domain>
+dig boundary.<domain> @<name server>       # ask Route 53 directly; read the status line
+```
 
 ### Bootstrap lock (laptop)
 
 ```bash
 # ids: vault-init, vault-restore, boundary-db-init
-aws dynamodb get-item --region $PRIMARY --table-name $PROJECT-bootstrap-lock \
+aws dynamodb get-item --region $PRIMARY_REGION --table-name $PROJECT-bootstrap-lock \
   --key '{"LockId":{"S":"vault-init"}}'
 
-aws dynamodb delete-item --region $PRIMARY --table-name $PROJECT-bootstrap-lock \
+aws dynamodb delete-item --region $PRIMARY_REGION --table-name $PROJECT-bootstrap-lock \
   --key '{"LockId":{"S":"vault-init"}}'
-```
-
-### DNS (laptop)
-
-```bash
-dig +short boundary.<domain>
-dig +short NS <domain>
-dig boundary.<domain> @<name server>       # ask Route 53 directly; read the status line
 ```
 
 ## Operations
 
 **Rolling out a change.** Templates and images take effect when a node boots.
 This project rolls changes out with a fresh `terraform apply`, not by patching
-running nodes.
+running nodes. Vault configuration changes go through the `config/` root.
 
-**Replacing one node.** Safe for every role. Vault, Consul and Nomad restore
-from their snapshots; Boundary resumes against its database; a worker's jobs
-are rescheduled. Take a snapshot first if recent writes matter.
+**Replacing one node.** This is safe for every role. Vault, Consul and Nomad
+restore from their snapshots, Boundary resumes against its database, and a
+worker's jobs are rescheduled. Take a snapshot first if recent writes matter.
+
+**Failing over.** Run `scripts/failover.sh`. While failed over, don't apply
+the infrastructure root without reading its plan first, because it would put
+the group sizes back to the values in code. After `scripts/failback.sh`
+finishes, that apply is exactly what is needed.
 
 **Rebuilding from nothing.** `terraform destroy` removes both regions,
 including the snapshot buckets, the init secrets and the database. The next
-apply is a new platform with new credentials, and the Boundary targets need
-recreating. KMS keys enter a 30-day deletion window.
+apply is a new platform with new credentials. Delete `config/terraform.tfstate`
+before applying `config/` again, and recreate the Boundary targets. KMS keys
+enter a 30-day deletion window.
 
 **Changing a node's size.** Set `instance_type` per group through the `ec2`
 module's `node_groups` input. Every `t3` size up to `large` counts as 2 vCPU.
@@ -629,17 +780,25 @@ Working today:
   primary ran in `eu-west-1`, and its service resolved by name from the primary
 - Vault restored in `eu-west-1` from the replicated snapshot, unsealed with the
   replica key, and readable with the original root token
+- Public apps on both load balancers behind a Route 53 failover record
+- Scripted failover to the pilot-light region and failback with Vault's data,
+  both exercised in drills
+
+In progress:
+
+- Step 4, part 1: Vault's SSH certificate authority, issuing role and
+  Boundary policy as code, in `config/`
 
 Planned next, in order:
 
-1. A public route to a workload in each region, with a Route 53 failover record
-2. A failover script that needs only the pilot-light region to be reachable
-3. A timed game day, to measure recovery time, data loss and the cost ratio
-4. Vault and Boundary configured as code: SSH certificate authority, dynamic
-   secrets, targets and credential brokering
-5. Hardening: gossip encryption keys for Consul and Nomad, then ACLs and TLS,
-   and a KMS keyring for Nomad
-6. A Network Load Balancer for internal traffic, Boundary in the pilot-light
+1. The rest of step 4. Boundary configured as code: scopes, a Vault credential
+   store, an AWS host catalog, SSH targets with certificates brokered from
+   Vault, and the Vault, Nomad and Consul targets. Then dynamic database
+   credentials.
+2. Hardening: gossip encryption keys for Consul and Nomad, then ACLs and TLS,
+   a KMS keyring for Nomad, a non-root admin login for `config/`, and pinned
+   product versions in the images
+3. A Network Load Balancer for internal traffic, Boundary in the pilot-light
    region, and three nodes per Raft group when quota allows
 
 ## Known limitations
@@ -649,11 +808,22 @@ Planned next, in order:
   in front of them.
 - Automatic restore of Consul and Nomad applies to single-server clusters only.
 - Boundary exists only in the primary region, and its targets are configured by
-  hand.
-- The pilot-light Vault must not run while the primary Vault is active.
+  hand until step 4 part 2. After a failover, the platform is administered
+  through Systems Manager until Boundary runs in the pilot light.
+- Boundary Community Edition cannot inject SSH certificates. They will be
+  brokered as JSON and used through a helper script instead.
+- The `config/` root authenticates to Vault with the root token, read
+  ephemerally and never stored in state.
+- The pilot-light Vault must not run while the primary Vault is active. The
+  failover script checks for this.
+- DNS failover depends on Route 53 health evaluation and on clients resolving
+  again. Open browser connections keep reaching the old region.
 - Nomad's snapshots contain its encryption keys, so the snapshot buckets are
   sensitive.
 - The Consul server config carries a workaround for a regression in Consul
-  2.0.4 (hashicorp/consul#23923) until the images pin an unaffected version.
-- No recovery times or cost figures are published yet; they come from the game
-  day.
+  2.0.4 (hashicorp/consul#23923), `limits { rpc_handshake_timeout = "0s" }`,
+  until the images pin an unaffected version.
+- No timed game day has been run, so recovery time, data loss and the cost
+  ratio are design targets, not measurements. The failover and failback
+  scripts have been exercised in drills. Data loss is bounded by design to the
+  10-minute snapshot interval.

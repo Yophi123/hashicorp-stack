@@ -39,3 +39,9 @@ output "pilot_light_autoscaling_group_names" {
   description = "ASG name per node group in the pilot-light region, for the failover script."
   value       = module.ec2_pilot_light.autoscaling_group_names
 }
+
+## App URLs
+output "public_app_urls" {
+  description = "Public URL per app. Served by whichever region is healthy."
+  value       = { for name in keys(var.public_apps) : name => module.alb.service_urls[name] }
+}
